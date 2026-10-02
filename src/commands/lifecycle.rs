@@ -10,6 +10,7 @@ use super::{
     DevcontainerInput, DevcontainerOpts, resolve_devcontainer, resolve_devcontainer_collect,
 };
 use super::{merge_runtime_guest_env, purge_all_data};
+use crate::agents::AgentKind;
 use crate::backend::VmBackend as _;
 use crate::{
     backend, config, devcontainer, github_repo, guest, guest_env_state, model_state, pat_prompt,
@@ -1498,6 +1499,63 @@ pub(crate) fn prepend_binary(binary: &str, args: Vec<String>) -> Vec<String> {
     command
 }
 
+/// Launch `agent` interactively in the guest. By default it runs with its
+/// own approval prompts bypassed (the VM is the isolation boundary); `ask`
+/// keeps them. See each agent's `*_launch_args` for the exact flags.
+pub(crate) fn cmd_agent_launch(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    agent: AgentKind,
+    name: Option<&config::InstanceName>,
+    ask: bool,
+    args: Vec<String>,
+) -> Result<()> {
+    let sess = open_ssh_session(be, cfg, name)?;
+    let (bin, args) = match agent {
+        AgentKind::Claude => (
+            agent.binary(&guest::GuestUser::new(sess.target.user.as_ref())?),
+            claude_launch_args(ask, args),
+        ),
+        AgentKind::Codex => {
+            let args = codex_launch_args(ask, args);
+            let bin = if cfg.codex.auth.uses_chatgpt_account() {
+                let inst = cfg.resolve_instance(name)?;
+                let model_state = model_state::ModelState::load_or_default(&inst)?;
+                backend::ensure_codex_remote_auth_consistent(cfg, &inst, &model_state)?;
+                backend::ensure_codex_account_guest_support(&sess.target)?;
+                // The wrapper gates on the guest's own config, so a guest that
+                // never got the keyring setting would silently pass through and
+                // write a plaintext token. Fail closed instead.
+                backend::ensure_codex_keyring_configured(&sess.target)?;
+                guest::codex_account_bin()
+            } else {
+                guest::codex_bin()
+            };
+            (bin, args)
+        }
+        AgentKind::Grok => (
+            agent.binary(&guest::GuestUser::new(sess.target.user.as_ref())?),
+            grok_launch_args(ask, args),
+        ),
+    };
+    ssh::run_interactive(&sess, &prepend_binary(bin.as_ref(), args))
+}
+
+/// Claude Code's flag pair for restoring permission prompts.
+const CLAUDE_PERMISSION_MODE: &str = "--permission-mode";
+const CLAUDE_PERMISSION_ASK: &str = "default";
+
+/// Guest user settings set `defaultMode: bypassPermissions`, so Claude Code
+/// already runs without prompts. Opting in to prompts with `ask` means
+/// overriding that default explicitly.
+pub(crate) fn claude_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String> {
+    if ask {
+        args.insert(0, CLAUDE_PERMISSION_ASK.to_string());
+        args.insert(0, CLAUDE_PERMISSION_MODE.to_string());
+    }
+    args
+}
+
 /// Codex's flag for running fully unrestricted (no sandbox, no approvals).
 const CODEX_BYPASS_FLAG: &str = "--dangerously-bypass-approvals-and-sandbox";
 
@@ -2697,6 +2755,21 @@ mod tests {
     fn prepend_binary_with_no_args() {
         let cmd = super::prepend_binary("/usr/bin/codex", Vec::new());
         assert_eq!(cmd, vec!["/usr/bin/codex"]);
+    }
+
+    #[test]
+    fn claude_launch_args_pass_through_by_default() {
+        let args = super::claude_launch_args(false, vec!["--model".into(), "opus".into()]);
+        assert_eq!(args, vec!["--model", "opus"]);
+    }
+
+    #[test]
+    fn claude_launch_args_ask_restores_default_permission_mode() {
+        let args = super::claude_launch_args(true, vec!["--model".into(), "opus".into()]);
+        assert_eq!(
+            args,
+            vec!["--permission-mode", "default", "--model", "opus"]
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! way lets fuzz targets and integration tests depend on `coop` directly
 //! (e.g. `coop::config::CoopConfig`) instead of `#[path]`-including modules.
 
+mod agents;
 mod backend;
 mod cmd;
 mod commands;
@@ -78,12 +79,12 @@ use commands::{
     AgentUpdateOpts, DevcontainerInput, DevcontainerOpts, ProfileImageTarget, ProjectTransport,
     QuickstartOpts, ReprovisionOpts, ResizeOpts, RestoreMode, RestoreOpts, StartOpts,
     UninstallOpts, UpDevcontainerOpts, UpOpts, UpRuntimeOpts, apply_runtime_guest_env,
-    apply_vm_overrides, cmd_agent_update, cmd_commit, cmd_destroy, cmd_devcontainer,
-    cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model,
-    cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start,
-    cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args,
-    open_ssh_session, preflight_start_target, prepend_binary, resolve_devcontainer,
-    resolve_devcontainer_collect, resolve_running,
+    apply_vm_overrides, cmd_agent_launch, cmd_agent_update, cmd_commit, cmd_destroy,
+    cmd_devcontainer, cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list,
+    cmd_model, cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell,
+    cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate, open_ssh_session,
+    preflight_start_target, prepend_binary, resolve_devcontainer, resolve_devcontainer_collect,
+    resolve_running,
 };
 
 #[derive(Parser)]
@@ -770,15 +771,8 @@ enum AgentAction {
             add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Update Claude Code (default: update every agent)
-        #[arg(long)]
-        claude: bool,
-        /// Update Codex (default: update every agent)
-        #[arg(long)]
-        codex: bool,
-        /// Update Grok Build (default: update every agent)
-        #[arg(long)]
-        grok: bool,
+        #[command(flatten)]
+        agents: AgentFlags,
         /// Only report installed vs. latest versions — change nothing
         #[arg(long)]
         check: bool,
@@ -786,6 +780,33 @@ enum AgentAction {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+}
+
+/// Per-agent selection flags for `coop agent update`.
+#[derive(clap::Args, Clone, Copy)]
+struct AgentFlags {
+    /// Update Claude Code (default: update every agent)
+    #[arg(long)]
+    claude: bool,
+    /// Update Codex (default: update every agent)
+    #[arg(long)]
+    codex: bool,
+    /// Update Grok Build (default: update every agent)
+    #[arg(long)]
+    grok: bool,
+}
+
+impl AgentFlags {
+    /// The agents whose flag is set, in [`agents::AgentKind::ALL`] order.
+    fn named(self) -> impl Iterator<Item = agents::AgentKind> {
+        agents::AgentKind::ALL
+            .into_iter()
+            .filter(move |agent| match agent {
+                agents::AgentKind::Claude => self.claude,
+                agents::AgentKind::Codex => self.codex,
+                agents::AgentKind::Grok => self.grok,
+            })
+    }
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -1383,50 +1404,30 @@ pub fn run() -> Result<()> {
             cmd_start(&be, &mut cfg, &start_opts).map(|_| ())
         }
         Commands::Shell { name, command } => cmd_shell(&be, &cfg, name.as_ref(), &command),
-        Commands::Claude {
-            name,
+        Commands::Claude { name, ask, args } => cmd_agent_launch(
+            &be,
+            &cfg,
+            agents::AgentKind::Claude,
+            name.as_ref(),
             ask,
-            mut args,
-        } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
-            // Guest user settings set `defaultMode: bypassPermissions`. Opting in
-            // to prompts means overriding that default explicitly.
-            if ask {
-                args.insert(0, "default".to_string());
-                args.insert(0, "--permission-mode".to_string());
-            }
-            let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-            ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
-        }
+            args,
+        ),
         Commands::ClaudeAgents { name, mut args } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             args.insert(0, "agents".to_string());
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
-        Commands::Codex { name, ask, args } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
-            let args = codex_launch_args(ask, args);
-            let codex_bin = if cfg.codex.auth.uses_chatgpt_account() {
-                let inst = cfg.resolve_instance(name.as_ref())?;
-                let model_state = model_state::ModelState::load_or_default(&inst)?;
-                backend::ensure_codex_remote_auth_consistent(&cfg, &inst, &model_state)?;
-                backend::ensure_codex_account_guest_support(&sess.target)?;
-                // The wrapper gates on the guest's own config, so a guest that
-                // never got the keyring setting would silently pass through and
-                // write a plaintext token. Fail closed instead.
-                backend::ensure_codex_keyring_configured(&sess.target)?;
-                guest::codex_account_bin()
-            } else {
-                guest::codex_bin()
-            };
-            ssh::run_interactive(&sess, &prepend_binary(codex_bin.as_ref(), args))
-        }
+        Commands::Codex { name, ask, args } => cmd_agent_launch(
+            &be,
+            &cfg,
+            agents::AgentKind::Codex,
+            name.as_ref(),
+            ask,
+            args,
+        ),
         Commands::Grok { name, ask, args } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
-            let args = grok_launch_args(ask, args);
-            let grok_bin = guest::GuestUser::new(sess.target.user.as_ref())?.grok_bin();
-            ssh::run_interactive(&sess, &prepend_binary(grok_bin.as_ref(), args))
+            cmd_agent_launch(&be, &cfg, agents::AgentKind::Grok, name.as_ref(), ask, args)
         }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_ref())?;
@@ -1442,9 +1443,7 @@ pub fn run() -> Result<()> {
             action:
                 AgentAction::Update {
                     name,
-                    claude,
-                    codex,
-                    grok,
+                    agents,
                     check,
                     yes,
                 },
@@ -1453,7 +1452,7 @@ pub fn run() -> Result<()> {
             &cfg,
             name.as_ref(),
             &AgentUpdateOpts {
-                selection: commands::AgentSelection::from_flags(claude, codex, grok),
+                selection: commands::AgentSelection::new(agents.named()),
                 check,
                 yes,
             },
@@ -1814,9 +1813,7 @@ token = "test-pat"
             action:
                 super::AgentAction::Update {
                     name,
-                    claude,
-                    codex,
-                    grok,
+                    agents,
                     check,
                     yes,
                 },
@@ -1828,11 +1825,31 @@ token = "test-pat"
             name.as_ref().map(super::config::InstanceName::as_str),
             Some("myvm")
         );
-        assert!(!claude);
-        assert!(codex);
-        assert!(!grok);
+        assert_eq!(
+            agents.named().collect::<Vec<_>>(),
+            [crate::agents::AgentKind::Codex]
+        );
         assert!(check);
         assert!(!yes);
+    }
+
+    #[test]
+    fn agent_update_flags_name_each_agent() {
+        use crate::agents::AgentKind;
+        for (flag, agent) in [
+            ("--claude", AgentKind::Claude),
+            ("--codex", AgentKind::Codex),
+            ("--grok", AgentKind::Grok),
+        ] {
+            let cli = parse(&["agent", "update", flag]);
+            let super::Commands::Agent {
+                action: super::AgentAction::Update { agents, .. },
+            } = cli.command
+            else {
+                panic!("expected Agent::Update variant");
+            };
+            assert_eq!(agents.named().collect::<Vec<_>>(), [agent], "{flag}");
+        }
     }
 
     #[test]
@@ -1842,9 +1859,7 @@ token = "test-pat"
             action:
                 super::AgentAction::Update {
                     name,
-                    claude,
-                    codex,
-                    grok,
+                    agents,
                     check,
                     yes,
                 },
@@ -1853,7 +1868,8 @@ token = "test-pat"
             panic!("expected Agent::Update variant");
         };
         assert!(name.is_none());
-        assert!(!claude && !codex && !grok && !check && !yes);
+        assert_eq!(agents.named().count(), 0);
+        assert!(!check && !yes);
     }
 
     #[test]

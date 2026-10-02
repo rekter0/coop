@@ -11,13 +11,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use crate::agents::AgentKind;
 use crate::backend::{Hostname, LogMode, SshTarget, SshUser};
 use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName, MiB};
 use crate::devcontainer_oci::{ResolvedFeature, installed_features};
 use crate::fs_util::{PrivateDir, PrivateEntryType};
 use crate::guest::{
-    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
-    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, SCRIPT_GROK,
+    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_DOCKER_REPO,
+    SCRIPT_GH_REPO,
 };
 use crate::remote_command::RemoteCommand;
 use crate::setup::{SetupOptions, TEMPLATE_VERSION, TemplateConfig, utc_timestamp};
@@ -909,15 +910,10 @@ fn needs_rebuild(
         return true;
     }
 
-    let (wanted_m, wanted_p) = crate::guest::collect_baked_lists(cfg, profiles);
-    let (wanted_cm, wanted_cp) = crate::guest::collect_codex_baked_lists(cfg);
-    let (wanted_gm, wanted_gp) = crate::guest::collect_grok_baked_lists(cfg);
-    existing.marketplaces != wanted_m
-        || existing.plugins != wanted_p
-        || existing.codex_marketplaces != wanted_cm
-        || existing.codex_plugins != wanted_cp
-        || existing.grok_marketplaces != wanted_gm
-        || existing.grok_plugins != wanted_gp
+    AgentKind::ALL.into_iter().any(|agent| {
+        let (wanted_marketplaces, wanted_plugins) = agent.baked_lists(cfg, profiles);
+        existing.baked(agent) != (wanted_marketplaces.as_slice(), wanted_plugins.as_slice())
+    })
 }
 
 fn build_golden_image(
@@ -1020,22 +1016,25 @@ fn build_golden_image(
     eprintln!("  Golden image: {} ({size_gib:.1} GiB)", base_img.display());
 
     // Write template config only after image swap succeeds
-    let template_config = TemplateConfig {
+    let mut template_config = TemplateConfig {
         version: TEMPLATE_VERSION,
         created: utc_timestamp(),
         install_script_hash: provision_script_hash(cfg, profiles, oci_features, guest_user),
         profiles: profiles.iter().map(|p| p.name.clone()).collect(),
         extra_packages: Vec::new(),
         post_install_hash: None,
-        marketplaces: baked.marketplaces,
-        plugins: baked.plugins,
-        codex_marketplaces: baked.codex_marketplaces,
-        codex_plugins: baked.codex_plugins,
-        grok_marketplaces: baked.grok_marketplaces,
-        grok_plugins: baked.grok_plugins,
+        marketplaces: Vec::new(),
+        plugins: Vec::new(),
+        codex_marketplaces: Vec::new(),
+        codex_plugins: Vec::new(),
+        grok_marketplaces: Vec::new(),
+        grok_plugins: Vec::new(),
         guest_user: guest_user.clone(),
         oci_features: installed_features(oci_features),
     };
+    for (agent, lists) in baked {
+        template_config.set_baked(agent, lists);
+    }
     template_config.save_for(cfg, image)?;
 
     Ok(())
@@ -1215,49 +1214,27 @@ fn builder_ssh_target(cfg: &CoopConfig, guest_user: &GuestUser) -> Result<SshTar
     })
 }
 
-/// Marketplace/plugin lists baked into a golden image, recorded in
+/// Per-agent marketplace/plugin lists baked into a golden image, recorded in
 /// `TemplateConfig` for staleness detection and the `FirstBoot` install delta.
-struct BakedLists {
-    marketplaces: Vec<String>,
-    plugins: Vec<String>,
-    codex_marketplaces: Vec<String>,
-    codex_plugins: Vec<String>,
-    grok_marketplaces: Vec<String>,
-    grok_plugins: Vec<String>,
-}
+type BakedLists = Vec<(AgentKind, (Vec<String>, Vec<String>))>;
 
-impl BakedLists {
-    fn is_empty(&self) -> bool {
-        self.marketplaces.is_empty()
-            && self.plugins.is_empty()
-            && self.codex_marketplaces.is_empty()
-            && self.codex_plugins.is_empty()
-            && self.grok_marketplaces.is_empty()
-            && self.grok_plugins.is_empty()
-    }
-}
-
-/// Install Claude, Codex, and Grok Build marketplaces and plugins in the
-/// builder VM via SSH. Returns the lists that were installed (for
-/// recording in `TemplateConfig`).
+/// Install every agent's marketplaces and plugins in the builder VM via
+/// SSH. Returns the lists that were installed (for recording in
+/// `TemplateConfig`).
 fn install_builder_plugins(
     cfg: &CoopConfig,
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
 ) -> Result<BakedLists> {
-    let (marketplaces, plugins) = crate::guest::collect_baked_lists(cfg, profiles);
-    let (codex_marketplaces, codex_plugins) = crate::guest::collect_codex_baked_lists(cfg);
-    let (grok_marketplaces, grok_plugins) = crate::guest::collect_grok_baked_lists(cfg);
-    let baked = BakedLists {
-        marketplaces,
-        plugins,
-        codex_marketplaces,
-        codex_plugins,
-        grok_marketplaces,
-        grok_plugins,
-    };
+    let baked: BakedLists = AgentKind::ALL
+        .into_iter()
+        .map(|agent| (agent, agent.baked_lists(cfg, profiles)))
+        .collect();
 
-    if baked.is_empty() {
+    if baked
+        .iter()
+        .all(|(_, (marketplaces, plugins))| marketplaces.is_empty() && plugins.is_empty())
+    {
         return Ok(baked);
     }
 
@@ -1271,33 +1248,15 @@ fn install_builder_plugins(
     }
 
     let session = crate::backend::SshSession { target, env };
-    let claude_bin = guest_user.claude_bin();
 
-    if !baked.marketplaces.is_empty() {
-        crate::backend::install_marketplaces(&session, &claude_bin, &baked.marketplaces)?;
-    }
-    if !baked.plugins.is_empty() {
-        crate::backend::install_plugins(&session, &claude_bin, &baked.plugins)?;
-    }
-
-    let codex_bin = crate::guest::codex_bin();
-    if !baked.codex_marketplaces.is_empty() {
-        crate::backend::install_codex_marketplaces(
+    for (agent, (marketplaces, plugins)) in &baked {
+        crate::backend::install_agent_plugins(
             &session,
-            &codex_bin,
-            &baked.codex_marketplaces,
+            *agent,
+            &agent.binary(guest_user),
+            marketplaces,
+            plugins,
         )?;
-    }
-    if !baked.codex_plugins.is_empty() {
-        crate::backend::install_codex_plugins(&session, &codex_bin, &baked.codex_plugins)?;
-    }
-
-    let grok_bin = guest_user.grok_bin();
-    if !baked.grok_marketplaces.is_empty() {
-        crate::backend::install_grok_marketplaces(&session, &grok_bin, &baked.grok_marketplaces)?;
-    }
-    if !baked.grok_plugins.is_empty() {
-        crate::backend::install_grok_plugins(&session, &grok_bin, &baked.grok_plugins)?;
     }
 
     Ok(baked)
@@ -1757,19 +1716,13 @@ fn compose_provision_script(
         s.push_str(&crate::devcontainer_oci::compose_install_snippet(feature));
     }
 
-    // Claude Code (direct binary download, runs as root, chowns to claude)
-    s.push_str(SCRIPT_CLAUDE_CODE);
-    s.push('\n');
-
-    // Codex CLI (native per-user package with a system compatibility link)
-    s.push_str(SCRIPT_CODEX);
-    s.push('\n');
-    s.push_str(SCRIPT_CODEX_ACCOUNT);
-    s.push('\n');
-
-    // Grok Build (official installer, runs as the guest user)
-    s.push_str(SCRIPT_GROK);
-    s.push('\n');
+    // Agent installers run as root and install for the guest user.
+    for agent in AgentKind::ALL {
+        for script in agent.install_scripts() {
+            s.push_str(script);
+            s.push('\n');
+        }
+    }
 
     // Test hook: inject a provision failure to exercise error detection.
     // Only activates when COOP_TEST_INJECT_PROVISION_FAILURE is set.

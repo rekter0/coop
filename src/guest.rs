@@ -6,7 +6,8 @@ use std::fmt;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CoopConfig, CustomProfile};
+use crate::agents::AgentKind;
+use crate::config::CustomProfile;
 use crate::paths::GuestPath;
 
 /// Devcontainer feature ids (bare names) that map to builtin profiles.
@@ -173,7 +174,8 @@ impl From<GuestUser> for String {
     }
 }
 
-/// Binaries that must exist in the guest image after provisioning.
+/// Binaries that must exist in the guest image after provisioning: Docker,
+/// `gh`, and each agent's [`AgentKind::required_binaries`].
 /// Absolute paths are checked directly; bare names are looked up via
 /// `command -v` (i.e. must be in the default system PATH).
 /// Codex's native installer owns package validation; coop checks the public
@@ -183,22 +185,17 @@ impl From<GuestUser> for String {
 /// build shell commands or inspect the chroot get path semantics for
 /// free (and the `/usr/bin/docker`/`/usr/bin/gh` entries can't be
 /// mistaken for host paths).
-pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 10] {
-    [
+pub fn required_guest_binaries(user: &GuestUser) -> Vec<GuestPath> {
+    let mut binaries = vec![
         GuestPath::new("/usr/bin/docker"),
         GuestPath::new("/usr/bin/gh"),
-        user.claude_bin(),
-        user.grok_bin(),
-        codex_bin(),
-        codex_code_mode_host_bin(),
-        codex_account_bin(),
-        // The Secret Service stack `codex-account` drives. Checking the
-        // wrapper alone proves nothing — the provision script always writes
-        // it — so verify the three tools its BASE_PACKAGES entries install.
-        GuestPath::new("/usr/bin/dbus-run-session"),
-        GuestPath::new("/usr/bin/gnome-keyring-daemon"),
-        GuestPath::new("/usr/bin/secret-tool"),
-    ]
+    ];
+    binaries.extend(
+        AgentKind::ALL
+            .into_iter()
+            .flat_map(|agent| agent.required_binaries(user)),
+    );
+    binaries
 }
 
 /// Verify that every required guest binary is present, bailing with a
@@ -456,59 +453,6 @@ pub fn lookup_profile(name: &str, custom: &HashMap<String, CustomProfile>) -> Re
     })
 }
 
-/// Collect combined marketplace and plugin lists from global config
-/// and all active profiles. Results are sorted and deduplicated.
-pub fn collect_baked_lists(
-    cfg: &CoopConfig,
-    profiles: &[ProfileDef],
-) -> (Vec<String>, Vec<String>) {
-    let mut marketplaces = cfg.claude.marketplaces.clone();
-    let mut plugins = cfg.claude.plugins.clone();
-
-    for def in profiles {
-        marketplaces.extend(def.marketplaces.iter().cloned());
-        plugins.extend(def.plugins.iter().cloned());
-    }
-
-    marketplaces.sort_unstable();
-    marketplaces.dedup();
-    plugins.sort_unstable();
-    plugins.dedup();
-
-    (marketplaces, plugins)
-}
-
-/// Collect Codex marketplace and plugin lists from global config.
-/// Results are sorted and deduplicated. Unlike [`collect_baked_lists`],
-/// profiles contribute nothing here: profile plugin lists are
-/// Claude-only, so Codex plugins come solely from `[codex]`.
-pub fn collect_codex_baked_lists(cfg: &CoopConfig) -> (Vec<String>, Vec<String>) {
-    let mut marketplaces = cfg.codex.marketplaces.clone();
-    let mut plugins = cfg.codex.plugins.clone();
-
-    marketplaces.sort_unstable();
-    marketplaces.dedup();
-    plugins.sort_unstable();
-    plugins.dedup();
-
-    (marketplaces, plugins)
-}
-
-/// Collect Grok Build marketplace and plugin lists from global config.
-/// Results are sorted and deduplicated. Profiles contribute nothing here:
-/// profile plugin lists are Claude-only.
-pub fn collect_grok_baked_lists(cfg: &CoopConfig) -> (Vec<String>, Vec<String>) {
-    let mut marketplaces = cfg.grok.marketplaces.clone();
-    let mut plugins = cfg.grok.plugins.clone();
-
-    marketplaces.sort_unstable();
-    marketplaces.dedup();
-    plugins.sort_unstable();
-    plugins.dedup();
-
-    (marketplaces, plugins)
-}
-
 #[cfg(test)]
 #[expect(clippy::panic, reason = "tests use panic for assertion failures")]
 #[expect(clippy::unwrap_used, reason = "tests use unwrap for brevity")]
@@ -693,47 +637,6 @@ mod tests {
             SCRIPT_CODEX_ACCOUNT.contains("this VM has no guest keyring yet"),
             "wrapper should explain that the first prompt chooses a password",
         );
-    }
-
-    #[test]
-    fn collect_baked_lists_merges_global_and_profile_entries() {
-        let mut cfg = CoopConfig::default();
-        cfg.claude.marketplaces = vec!["z".into(), "a".into(), "a".into()];
-        cfg.claude.plugins = vec!["p2@z".into(), "p1@a".into()];
-        cfg.codex.marketplaces = vec!["codex-only".into()];
-        cfg.codex.plugins = vec!["codex-only-plugin".into()];
-        let profile = ProfileDef {
-            name: "custom".into(),
-            apt_packages: vec![],
-            pre_install: None,
-            post_install: None,
-            marketplaces: vec!["b".into(), "a".into()],
-            plugins: vec!["p3@b".into(), "p1@a".into()],
-        };
-
-        let (marketplaces, plugins) = collect_baked_lists(&cfg, &[profile]);
-        assert_eq!(marketplaces, ["a", "b", "z"]);
-        assert_eq!(plugins, ["p1@a", "p2@z", "p3@b"]);
-    }
-
-    #[test]
-    fn collect_codex_baked_lists_sorts_and_dedups() {
-        let mut cfg = CoopConfig::default();
-        cfg.codex.marketplaces = vec!["b".into(), "a".into(), "a".into()];
-        cfg.codex.plugins = vec!["p2@b".into(), "p1@a".into(), "p2@b".into()];
-        let (marketplaces, plugins) = collect_codex_baked_lists(&cfg);
-        assert_eq!(marketplaces, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(plugins, vec!["p1@a".to_string(), "p2@b".to_string()]);
-    }
-
-    #[test]
-    fn collect_grok_baked_lists_sorts_and_dedups() {
-        let mut cfg = CoopConfig::default();
-        cfg.grok.marketplaces = vec!["b".into(), "a".into(), "a".into()];
-        cfg.grok.plugins = vec!["p2@b".into(), "p1@a".into(), "p2@b".into()];
-        let (marketplaces, plugins) = collect_grok_baked_lists(&cfg);
-        assert_eq!(marketplaces, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(plugins, vec!["p1@a".to_string(), "p2@b".to_string()]);
     }
 
     #[test]

@@ -353,12 +353,14 @@ exclude_re = [
 
   # ---- coop agent update (#402): in-guest agent refresh ----
   # The pure logic is extracted and unit-tested in scope: AgentSelection
-  # (from_flags / agents), Agent (display / strategy), AgentVersion::parse
+  # (new / agents), strategy, auto_updates, AgentVersion::parse
   # (+ from_token), check_status, check_report / check_line, outcome_line,
-  # and selection_phrase. What is excluded below drives SSH into the guest,
+  # and selection_phrase, plus the shared per-agent facts on AgentKind in
+  # src/agents.rs. What is excluded below drives SSH into the guest,
   # hits the GitHub release API, writes stdout, or resolves a guest binary
   # path from a live session — none observable from a `--lib` test.
-  # (cmd_agent_update itself is covered by the module-wide `\bcmd_[a-z_]+\b`.)
+  # (cmd_agent_update and cmd_agent_launch are covered by the module-wide
+  # `\bcmd_[a-z_]+\b`.)
   # tests/integration.sh exercises the end-to-end update/check on both backends.
   "\\brun_updates\\b",
   "\\brun_check\\b",

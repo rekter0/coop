@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
 use toml::Value as TomlValue;
 
+use crate::agents::AgentKind;
 use crate::cmd::Cmd;
 use crate::config::{
     CodexAuthMode, ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, LocalModel,
@@ -1526,17 +1527,14 @@ pub fn prepare_env_forwarding(
         }
     };
 
-    // User-specified env_forward vars from process environment, plus
-    // host names referenced by Grok stdio MCP `env` mappings (those
-    // become `${NAME}` in the guest config and must exist there).
-    let grok_mcp_env_names = grok.stdio_env_host_names();
-    for name in claude
-        .env_forward
-        .iter()
-        .chain(codex.env_forward.iter())
-        .chain(grok.env_forward.iter())
-        .chain(grok_mcp_env_names.iter())
-    {
+    // User-specified env_forward vars from process environment, plus the
+    // other host names an agent's config needs in the guest (see
+    // `AgentKind::env_forward_names`).
+    let forwarded_names: Vec<_> = AgentKind::ALL
+        .into_iter()
+        .flat_map(|agent| agent.env_forward_names(cfg))
+        .collect();
+    for name in &forwarded_names {
         if suppressed.contains(&name.as_str()) {
             let reason = suppression_reason(name.as_str());
             tracing::warn!("{reason}: ignoring env_forward entry '{name}'");
@@ -1602,9 +1600,13 @@ pub fn bootstrap_agents(
         setup_github_auth(session)?;
     }
 
-    bootstrap_claude(session, cfg, inst, mode, guest_host)?;
-    bootstrap_codex(session, cfg, inst, mode, guest_host)?;
-    bootstrap_grok(session, cfg, inst, mode)?;
+    for agent in AgentKind::ALL {
+        match agent {
+            AgentKind::Claude => bootstrap_claude(session, cfg, inst, mode, guest_host)?,
+            AgentKind::Codex => bootstrap_codex(session, cfg, inst, mode, guest_host)?,
+            AgentKind::Grok => bootstrap_grok(session, cfg, inst, mode)?,
+        }
+    }
 
     Ok(())
 }
@@ -1689,15 +1691,15 @@ fn bootstrap_claude(
         if let BootMode::FirstBoot = mode {
             // Compute delta: only install marketplaces/plugins not already
             // baked into the golden image
-            let (missing_marketplaces, missing_plugins) = compute_plugin_delta(cfg, &inst.image);
-
-            if !missing_marketplaces.is_empty() {
-                install_marketplaces(session, &claude_bin, &missing_marketplaces)?;
-            }
-
-            if !missing_plugins.is_empty() {
-                install_plugins(session, &claude_bin, &missing_plugins)?;
-            }
+            let (missing_marketplaces, missing_plugins) =
+                compute_plugin_delta(cfg, &inst.image, AgentKind::Claude);
+            install_agent_plugins(
+                session,
+                AgentKind::Claude,
+                &claude_bin,
+                &missing_marketplaces,
+                &missing_plugins,
+            )?;
 
             if !claude.mcp_servers.is_empty() {
                 register_mcp_servers(session, &claude_bin, &claude.mcp_servers)?;
@@ -1830,17 +1832,15 @@ fn bootstrap_codex(
         // on first boot — marketplaces first, since `plugin add` resolves against a
         // configured marketplace.
         if let BootMode::FirstBoot = mode {
-            let codex_bin = crate::guest::codex_bin();
             let (missing_marketplaces, missing_plugins) =
-                compute_codex_plugin_delta(cfg, &inst.image);
-
-            if !missing_marketplaces.is_empty() {
-                install_codex_marketplaces(session, &codex_bin, &missing_marketplaces)?;
-            }
-
-            if !missing_plugins.is_empty() {
-                install_codex_plugins(session, &codex_bin, &missing_plugins)?;
-            }
+                compute_plugin_delta(cfg, &inst.image, AgentKind::Codex);
+            install_agent_plugins(
+                session,
+                AgentKind::Codex,
+                &crate::guest::codex_bin(),
+                &missing_marketplaces,
+                &missing_plugins,
+            )?;
         }
 
         match mode {
@@ -1895,15 +1895,15 @@ fn bootstrap_grok(
     write_workspace_folder_trust(&session.target)?;
 
     if let BootMode::FirstBoot = mode {
-        let (missing_marketplaces, missing_plugins) = compute_grok_plugin_delta(cfg, &inst.image);
-
-        if !missing_marketplaces.is_empty() {
-            install_grok_marketplaces(session, &grok_bin, &missing_marketplaces)?;
-        }
-
-        if !missing_plugins.is_empty() {
-            install_grok_plugins(session, &grok_bin, &missing_plugins)?;
-        }
+        let (missing_marketplaces, missing_plugins) =
+            compute_plugin_delta(cfg, &inst.image, AgentKind::Grok);
+        install_agent_plugins(
+            session,
+            AgentKind::Grok,
+            &grok_bin,
+            &missing_marketplaces,
+            &missing_plugins,
+        )?;
     }
 
     tracing::info!("Grok Build bootstrap complete");
@@ -2050,49 +2050,19 @@ fn plugin_delta(
     )
 }
 
-/// Compute which Claude marketplaces and plugins are missing from the
-/// golden image and need to be installed at start time.
-fn compute_plugin_delta(cfg: &CoopConfig, image: &ImageName) -> (Vec<String>, Vec<String>) {
-    let (baked_m, baked_p) = crate::setup::TemplateConfig::load_for(cfg, image)
-        .ok()
-        .map(|tc| (tc.marketplaces, tc.plugins))
-        .unwrap_or_default();
-    plugin_delta(
-        &cfg.claude.marketplaces,
-        &cfg.claude.plugins,
-        &baked_m,
-        &baked_p,
-    )
-}
-
-/// Compute which Codex marketplaces and plugins are missing from the
-/// golden image and need to be installed at start time.
-fn compute_codex_plugin_delta(cfg: &CoopConfig, image: &ImageName) -> (Vec<String>, Vec<String>) {
-    let (baked_m, baked_p) = crate::setup::TemplateConfig::load_for(cfg, image)
-        .ok()
-        .map(|tc| (tc.codex_marketplaces, tc.codex_plugins))
-        .unwrap_or_default();
-    plugin_delta(
-        &cfg.codex.marketplaces,
-        &cfg.codex.plugins,
-        &baked_m,
-        &baked_p,
-    )
-}
-
-/// Compute which Grok Build marketplaces and plugins are missing from the
-/// golden image and need to be installed at start time.
-fn compute_grok_plugin_delta(cfg: &CoopConfig, image: &ImageName) -> (Vec<String>, Vec<String>) {
-    let (baked_m, baked_p) = crate::setup::TemplateConfig::load_for(cfg, image)
-        .ok()
-        .map(|tc| (tc.grok_marketplaces, tc.grok_plugins))
-        .unwrap_or_default();
-    plugin_delta(
-        &cfg.grok.marketplaces,
-        &cfg.grok.plugins,
-        &baked_m,
-        &baked_p,
-    )
+/// Compute which of `agent`'s configured marketplaces and plugins are
+/// missing from the golden image and need to be installed at start time.
+fn compute_plugin_delta(
+    cfg: &CoopConfig,
+    image: &ImageName,
+    agent: AgentKind,
+) -> (Vec<String>, Vec<String>) {
+    let template = crate::setup::TemplateConfig::load_for(cfg, image).ok();
+    let (baked_m, baked_p) = template
+        .as_ref()
+        .map_or((&[][..], &[][..]), |tc| tc.baked(agent));
+    let (wanted_m, wanted_p) = agent.configured_plugins(cfg);
+    plugin_delta(wanted_m, wanted_p, baked_m, baked_p)
 }
 
 /// Resolve a GitHub token for the guest given the configured auth strategy
@@ -3816,7 +3786,34 @@ fn stage_marketplace_source(
     Ok(remote.to_string())
 }
 
-pub(crate) fn install_marketplaces(
+/// Register `marketplaces`, then install `plugins`, with `agent`'s own plugin
+/// CLI at `bin`. Marketplaces go first because a plugin resolves against a
+/// registered marketplace. Empty lists are skipped.
+pub(crate) fn install_agent_plugins(
+    session: &SshSession,
+    agent: AgentKind,
+    bin: &GuestPath,
+    marketplaces: &[String],
+    plugins: &[String],
+) -> Result<()> {
+    if !marketplaces.is_empty() {
+        match agent {
+            AgentKind::Claude => install_marketplaces(session, bin, marketplaces)?,
+            AgentKind::Codex => install_codex_marketplaces(session, bin, marketplaces)?,
+            AgentKind::Grok => install_grok_marketplaces(session, bin, marketplaces)?,
+        }
+    }
+    if !plugins.is_empty() {
+        match agent {
+            AgentKind::Claude => install_plugins(session, bin, plugins)?,
+            AgentKind::Codex => install_codex_plugins(session, bin, plugins)?,
+            AgentKind::Grok => install_grok_plugins(session, bin, plugins)?,
+        }
+    }
+    Ok(())
+}
+
+fn install_marketplaces(
     session: &SshSession,
     claude_bin: &GuestPath,
     marketplaces: &[String],
@@ -3837,11 +3834,7 @@ pub(crate) fn install_marketplaces(
     Ok(())
 }
 
-pub(crate) fn install_plugins(
-    session: &SshSession,
-    claude_bin: &GuestPath,
-    plugins: &[String],
-) -> Result<()> {
+fn install_plugins(session: &SshSession, claude_bin: &GuestPath, plugins: &[String]) -> Result<()> {
     for plugin in plugins {
         tracing::info!("Installing plugin: {plugin}");
         let cmd = RemoteCommand::new()
@@ -3862,7 +3855,7 @@ pub(crate) fn install_plugins(
 /// no `--scope` flag; the registration is written to `~/.codex/config.toml`
 /// under `[marketplaces.<name>]`. Local directories are copied into the
 /// guest first, mirroring [`install_marketplaces`].
-pub(crate) fn install_codex_marketplaces(
+fn install_codex_marketplaces(
     session: &SshSession,
     codex_bin: &GuestPath,
     marketplaces: &[String],
@@ -3887,7 +3880,7 @@ pub(crate) fn install_codex_marketplaces(
 /// The subcommand is `add` (not `install`, as for Claude), and there is
 /// no `-s user` scope flag; enabled state is recorded in
 /// `~/.codex/config.toml` under `[plugins.<name>]`.
-pub(crate) fn install_codex_plugins(
+fn install_codex_plugins(
     session: &SshSession,
     codex_bin: &GuestPath,
     plugins: &[String],
@@ -3909,7 +3902,7 @@ pub(crate) fn install_codex_plugins(
 ///
 /// Local directories are copied into the guest first, mirroring
 /// [`install_marketplaces`].
-pub(crate) fn install_grok_marketplaces(
+fn install_grok_marketplaces(
     session: &SshSession,
     grok_bin: &GuestPath,
     marketplaces: &[String],
@@ -3933,7 +3926,7 @@ pub(crate) fn install_grok_marketplaces(
 ///
 /// `--trust` is required: without it Grok prints a warning and stops,
 /// which would fail first-boot bootstrap.
-pub(crate) fn install_grok_plugins(
+fn install_grok_plugins(
     session: &SshSession,
     grok_bin: &GuestPath,
     plugins: &[String],
@@ -6177,22 +6170,29 @@ url = "https://example.com/m"
     }
 
     #[test]
-    fn compute_codex_plugin_delta_reads_codex_fields_not_claude() {
-        // Pins the field wiring: the Codex delta must diff cfg.codex.* against
-        // the template's codex_* lists, ignoring the Claude marketplaces/plugins
-        // (backend.rs is mutation-excluded, so a copy-paste slip to a Claude
-        // field would otherwise go uncaught).
+    fn compute_plugin_delta_reads_each_agents_own_fields() {
+        // Pins the field wiring: each agent's delta must diff its own config
+        // section against its own template lists (backend.rs is
+        // mutation-excluded, so a copy-paste slip to another agent's field
+        // would otherwise go uncaught). Every template list bakes that
+        // agent's "-baked" entry plus every OTHER agent's "-new" entry as a
+        // decoy, so reading the wrong list leaves "-baked" missing instead.
         let tmp = tempfile::TempDir::new().unwrap();
         let mut cfg = CoopConfig {
             data_dir: crate::config::ConfigPath::new(tmp.path()),
             ..CoopConfig::default()
         };
-        cfg.codex.marketplaces = vec!["m-baked".into(), "m-new".into()];
-        cfg.codex.plugins = vec!["p-baked@m".into(), "p-new@m".into()];
+        let lists = |agent: &str| {
+            (
+                vec![format!("{agent}-baked"), format!("{agent}-new")],
+                vec![format!("{agent}-p-baked"), format!("{agent}-p-new")],
+            )
+        };
+        (cfg.claude.marketplaces, cfg.claude.plugins) = lists("claude");
+        (cfg.codex.marketplaces, cfg.codex.plugins) = lists("codex");
+        (cfg.grok.marketplaces, cfg.grok.plugins) = lists("grok");
         let image = ImageName::new("default").unwrap();
 
-        // Bake one of each Codex entry — plus decoy Claude entries that must be
-        // ignored — into the on-disk template config.
         std::fs::create_dir_all(cfg.image_dir(&image)).unwrap();
         let json = r#"{
             "version": 1,
@@ -6201,48 +6201,41 @@ url = "https://example.com/m"
             "profiles": [],
             "extra_packages": [],
             "post_install_hash": null,
-            "marketplaces": ["m-new"],
-            "plugins": ["p-new@m"],
-            "codex_marketplaces": ["m-baked"],
-            "codex_plugins": ["p-baked@m"]
+            "marketplaces": ["claude-baked", "codex-new", "grok-new"],
+            "plugins": ["claude-p-baked", "codex-p-new", "grok-p-new"],
+            "codex_marketplaces": ["codex-baked", "claude-new", "grok-new"],
+            "codex_plugins": ["codex-p-baked", "claude-p-new", "grok-p-new"],
+            "grok_marketplaces": ["grok-baked", "claude-new", "codex-new"],
+            "grok_plugins": ["grok-p-baked", "claude-p-new", "codex-p-new"]
         }"#;
         std::fs::write(cfg.template_config_path_for(&image), json).unwrap();
 
-        let (missing_m, missing_p) = compute_codex_plugin_delta(&cfg, &image);
-        // Only the non-baked Codex entries remain. If the delta read the Claude
-        // `marketplaces`/`plugins` (which bake "m-new"/"p-new@m"), those would
-        // be filtered out and the assertion would fail.
-        assert_eq!(missing_m, vec!["m-new".to_string()]);
-        assert_eq!(missing_p, vec!["p-new@m".to_string()]);
+        for (agent, name) in [
+            (AgentKind::Claude, "claude"),
+            (AgentKind::Codex, "codex"),
+            (AgentKind::Grok, "grok"),
+        ] {
+            let (missing_m, missing_p) = compute_plugin_delta(&cfg, &image, agent);
+            assert_eq!(missing_m, [format!("{name}-new")], "{agent:?}");
+            assert_eq!(missing_p, [format!("{name}-p-new")], "{agent:?}");
+        }
     }
 
     #[test]
-    fn compute_grok_plugin_delta_returns_unbaked_entries() {
+    fn compute_plugin_delta_installs_everything_without_template_config() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut cfg = CoopConfig {
             data_dir: crate::config::ConfigPath::new(tmp.path()),
             ..CoopConfig::default()
         };
-        cfg.grok.marketplaces = vec!["m-baked".into(), "m-new".into()];
-        cfg.grok.plugins = vec!["p-baked@m".into(), "p-new@m".into()];
+        cfg.grok.marketplaces = vec!["m".into()];
+        cfg.grok.plugins = vec!["p@m".into()];
         let image = ImageName::new("default").unwrap();
-
         std::fs::create_dir_all(cfg.image_dir(&image)).unwrap();
-        let json = r#"{
-            "version": 1,
-            "created": "2026-01-01T00:00:00Z",
-            "install_script_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-            "profiles": [],
-            "extra_packages": [],
-            "post_install_hash": null,
-            "grok_marketplaces": ["m-baked"],
-            "grok_plugins": ["p-baked@m"]
-        }"#;
-        std::fs::write(cfg.template_config_path_for(&image), json).unwrap();
 
-        let (missing_m, missing_p) = compute_grok_plugin_delta(&cfg, &image);
-        assert_eq!(missing_m, vec!["m-new".to_string()]);
-        assert_eq!(missing_p, vec!["p-new@m".to_string()]);
+        let (missing_m, missing_p) = compute_plugin_delta(&cfg, &image, AgentKind::Grok);
+        assert_eq!(missing_m, ["m"]);
+        assert_eq!(missing_p, ["p@m"]);
     }
 
     #[test]

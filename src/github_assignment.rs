@@ -6,6 +6,7 @@ use std::io::Read as _;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::agents::AgentKind;
 use crate::config::{CoopConfig, Instance};
 use crate::github_repo::RepoSlug;
 use crate::guest_env_state::GuestEnvState;
@@ -93,16 +94,11 @@ pub fn active(cfg: &CoopConfig, inst: &Instance) -> Result<Option<Assignment>> {
     if let Some(assignment) = &assignment {
         assignment.validate(cfg)?;
         reject_overrides(cfg.guest_env.keys().map(AsRef::as_ref))?;
-        let grok_mcp_hosts = cfg.grok.stdio_env_host_names();
-        reject_overrides(
-            cfg.claude
-                .env_forward
-                .iter()
-                .chain(&cfg.codex.env_forward)
-                .chain(&cfg.grok.env_forward)
-                .map(AsRef::as_ref)
-                .chain(grok_mcp_hosts.iter().map(AsRef::as_ref)),
-        )?;
+        let forwarded_names: Vec<_> = AgentKind::ALL
+            .into_iter()
+            .flat_map(|agent| agent.env_forward_names(cfg))
+            .collect();
+        reject_overrides(forwarded_names.iter().map(AsRef::as_ref))?;
         if let Some(state) = GuestEnvState::try_load(inst)? {
             reject_overrides(state.entries.keys().map(AsRef::as_ref))?;
         }

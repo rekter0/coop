@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::agents::AgentKind;
 use crate::cmd::{Cmd, command_exists};
 #[cfg(target_os = "linux")]
 use crate::config::Instance;
@@ -16,9 +17,8 @@ use crate::config::{CoopConfig, ImageName, InstanceName};
 use crate::devcontainer_oci::installed_features;
 use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature};
 use crate::guest::{
-    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
-    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, SCRIPT_GROK,
-    resolve_profiles,
+    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_DOCKER_REPO,
+    SCRIPT_GH_REPO, resolve_profiles,
 };
 use crate::sha256_hash::Sha256Hash;
 
@@ -98,6 +98,25 @@ impl TemplateConfig {
             .with_context(|| format!("Failed to write {}", path.display()))?;
         tracing::debug!("Wrote template config to {}", path.display());
         Ok(())
+    }
+
+    /// Marketplaces and plugins baked into this image for `agent`.
+    pub fn baked(&self, agent: AgentKind) -> (&[String], &[String]) {
+        match agent {
+            AgentKind::Claude => (&self.marketplaces, &self.plugins),
+            AgentKind::Codex => (&self.codex_marketplaces, &self.codex_plugins),
+            AgentKind::Grok => (&self.grok_marketplaces, &self.grok_plugins),
+        }
+    }
+
+    /// Record the marketplaces and plugins baked into this image for `agent`.
+    pub fn set_baked(&mut self, agent: AgentKind, lists: (Vec<String>, Vec<String>)) {
+        let (marketplaces, plugins) = match agent {
+            AgentKind::Claude => (&mut self.marketplaces, &mut self.plugins),
+            AgentKind::Codex => (&mut self.codex_marketplaces, &mut self.codex_plugins),
+            AgentKind::Grok => (&mut self.grok_marketplaces, &mut self.grok_plugins),
+        };
+        (*marketplaces, *plugins) = lists;
     }
 }
 
@@ -934,13 +953,12 @@ fn compose_recipe(
     for feature in oci_features {
         s.push_str(&crate::devcontainer_oci::compose_install_snippet(feature));
     }
-    // Direct binary download (runs as root in chroot, installs for guest user).
-    s.push_str(SCRIPT_CLAUDE_CODE);
-    // Codex's native installer keeps the full package under the guest user's home.
-    s.push_str(SCRIPT_CODEX);
-    s.push_str(SCRIPT_CODEX_ACCOUNT);
-    // Grok Build installs under ~/.grok/bin for the guest user.
-    s.push_str(SCRIPT_GROK);
+    // Agent installers run as root in the chroot and install for the guest user.
+    for agent in AgentKind::ALL {
+        for script in agent.install_scripts() {
+            s.push_str(script);
+        }
+    }
 
     s
 }
@@ -1865,6 +1883,50 @@ mod tests {
         assert!(tc.codex_plugins.is_empty());
         assert!(tc.grok_marketplaces.is_empty());
         assert!(tc.grok_plugins.is_empty());
+    }
+
+    #[test]
+    fn set_baked_writes_each_agents_on_disk_fields() {
+        // The JSON field names are the on-disk contract `baked` reads back,
+        // so pin them directly rather than only round-tripping the accessors.
+        let json = r#"{
+            "version": 1,
+            "created": "2026-01-01T00:00:00Z",
+            "install_script_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "profiles": [],
+            "extra_packages": [],
+            "post_install_hash": null
+        }"#;
+        let mut tc: TemplateConfig = serde_json::from_str(json).unwrap();
+        let agents = [
+            (AgentKind::Claude, "claude", "marketplaces", "plugins"),
+            (
+                AgentKind::Codex,
+                "codex",
+                "codex_marketplaces",
+                "codex_plugins",
+            ),
+            (AgentKind::Grok, "grok", "grok_marketplaces", "grok_plugins"),
+        ];
+        for (agent, name, _, _) in agents {
+            tc.set_baked(
+                agent,
+                (vec![format!("{name}-m")], vec![format!("{name}-p")]),
+            );
+        }
+
+        let saved = serde_json::to_value(&tc).unwrap();
+        for (agent, name, marketplaces_field, plugins_field) in agents {
+            let marketplace = format!("{name}-m");
+            let plugin = format!("{name}-p");
+            assert_eq!(saved[marketplaces_field], serde_json::json!([marketplace]));
+            assert_eq!(saved[plugins_field], serde_json::json!([plugin]));
+            assert_eq!(
+                tc.baked(agent),
+                (&[marketplace][..], &[plugin][..]),
+                "{agent:?}"
+            );
+        }
     }
 
     #[test]

@@ -19,6 +19,7 @@ coop/
 ├── src/
 │   ├── main.rs             # thin binary shim → coop::run()
 │   ├── lib.rs              # clap CLI definition + central command dispatcher
+│   ├── agents.rs           # AgentKind: the guest agents and their shared facts
 │   ├── backend.rs          # VmBackend trait, PlatformBackend alias, shared guest ops
 │   ├── vm.rs               # Firecracker process management (typestate machine)
 │   ├── lima.rs             # macOS/Lima backend implementation
@@ -144,6 +145,20 @@ exec/stop/destroy/status/list/resize/commit/restore), `quickstart.rs`,
 and `json.rs` (machine-readable `--json` output types). `commands/mod.rs`
 re-exports the dispatch surface and holds cross-domain helpers
 (`merge_runtime_guest_env`, `purge_all_data`).
+
+## Guest agents
+
+`agents::AgentKind` lists the coding agents baked into every image. It owns
+the facts shared code needs about each one: display name, guest binary,
+installer scripts, required binaries, forwarded env-var names, and
+marketplace/plugin lists. Code that does something per agent — image
+provisioning, the required-binary check, plugin baking and the first-boot
+delta, `bootstrap_agents`, env forwarding, `coop <agent>` launch, and
+`coop agent update` — iterates `AgentKind::ALL` and matches exhaustively, so a
+new variant fails to compile everywhere it needs a decision. Behavior unique
+to one agent (proxy and local-model routing, Codex account auth, config
+merges) stays in that agent's bootstrap. `TemplateConfig` keeps one field pair
+per agent for on-disk compatibility, reached through `baked` / `set_baked`.
 
 ## Data flow: host → guest
 
