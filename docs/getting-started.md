@@ -1,6 +1,6 @@
 # Getting Started
 
-coop runs Claude Code, Codex, and Grok Build inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. Each VM gets its own filesystem, network stack, and Docker daemon. Agent CLIs never touch your host.
+coop runs Claude Code, Codex, Grok Build, and omp inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. Each VM gets its own filesystem, network stack, and Docker daemon. Agent CLIs never touch your host.
 
 ## Prerequisites
 
@@ -197,6 +197,9 @@ config_dir = "~/.codex"
 
 [grok]
 config_dir = "~/.grok"
+
+[omp]
+config_dir = "~/.omp/agent"
 ```
 
 The `github` field controls how coop resolves a GitHub token for the guest:
@@ -212,6 +215,8 @@ coop picks up `ANTHROPIC_API_KEY`, `XAI_API_KEY`, and, in the default Codex
 API-key mode, `OPENAI_API_KEY` from your environment automatically. Setting
 them explicitly under `claude.api_key`, `codex.api_key`, or `grok.api_key`
 also works, but environment variables are preferred.
+omp reads the same three keys; list any other provider key it needs under
+`[omp] env_forward`.
 
 For Codex account or workspace access without OpenAI API billing, set
 `[codex] auth = "chatgpt"` and rebuild any old image with `coop setup
@@ -313,6 +318,7 @@ coop shell
 coop claude
 coop codex
 coop grok
+coop omp
 ```
 
 ### 3. Restart a stopped instance
@@ -345,7 +351,7 @@ coop up ~/code/my-project --profile python,node
 coop up --git-repo https://github.com/trailofbits/coop.git
 ```
 
-Skip Claude Code, Codex, and Grok Build credential/config injection:
+Skip Claude Code, Codex, Grok Build, and omp credential/config injection:
 
 ```
 coop start my-project --no-agents
@@ -408,6 +414,21 @@ Pass extra arguments through to `grok`:
 
 ```
 coop grok -- --model grok-4.6
+```
+
+**Launch omp inside the VM:**
+
+```
+coop omp
+```
+
+coop launches `omp --yolo`. For approval prompts, pass `--ask` (coop passes
+`--approval-mode always-ask`). A host `~/.omp/agent/agent.db` is copied into
+the guest on boot, so host logins carry over. Otherwise sign in from the
+guest:
+
+```
+coop omp -- login
 ```
 
 **Open a shell in the VM:**
@@ -526,6 +547,7 @@ coop images --delete python-dev
 - [Claude Code integration](claude-integration.md)
 - [Codex integration](codex-integration.md)
 - [Grok Build integration](grok-integration.md)
+- [omp integration](omp-integration.md)
 - [Editor integration](editor.md)
 - [Running multiple instances](multi-instance.md)
 - [Platform backends](backends.md)

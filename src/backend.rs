@@ -1605,6 +1605,7 @@ pub fn bootstrap_agents(
             AgentKind::Claude => bootstrap_claude(session, cfg, inst, mode, guest_host)?,
             AgentKind::Codex => bootstrap_codex(session, cfg, inst, mode, guest_host)?,
             AgentKind::Grok => bootstrap_grok(session, cfg, inst, mode)?,
+            AgentKind::Omp => bootstrap_omp(session, cfg, inst, mode)?,
         }
     }
 
@@ -1907,6 +1908,56 @@ fn bootstrap_grok(
     }
 
     tracing::info!("Grok Build bootstrap complete");
+    Ok(())
+}
+
+/// Bootstrap omp in the guest declaratively.
+///
+/// Copies allowlisted host content into `~/.omp/agent/` (including the
+/// `agent.db` credential store, restricted to owner-only), merges MCP
+/// servers into `~/.omp/agent/mcp.json`, and (on first boot) installs
+/// marketplaces/plugins not already baked into the golden image.
+fn bootstrap_omp(
+    session: &SshSession,
+    cfg: &CoopConfig,
+    inst: &crate::config::Instance,
+    mode: BootMode,
+) -> Result<()> {
+    let omp = &cfg.omp;
+    let omp_bin = persisted_guest_user(cfg, &inst.image).omp_bin();
+
+    if let BootMode::FirstBoot = mode {
+        let needs_omp_cli = !omp.marketplaces.is_empty() || !omp.plugins.is_empty();
+        if needs_omp_cli
+            && !session
+                .target
+                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&omp_bin))
+        {
+            bail!(
+                "omp is not installed in the guest.\n\
+                 The golden image may have been built before omp support \
+                 was added, or the install failed.\n\
+                 Run `coop setup --rebuild` to rebuild the image."
+            );
+        }
+    }
+
+    copy_omp_config(&session.target, &omp.config_dir)?;
+    write_managed_omp_mcp(&session.target, &omp.config_dir, &omp.mcp_servers)?;
+
+    if let BootMode::FirstBoot = mode {
+        let (missing_marketplaces, missing_plugins) =
+            compute_plugin_delta(cfg, &inst.image, AgentKind::Omp);
+        install_agent_plugins(
+            session,
+            AgentKind::Omp,
+            &omp_bin,
+            &missing_marketplaces,
+            &missing_plugins,
+        )?;
+    }
+
+    tracing::info!("omp bootstrap complete");
     Ok(())
 }
 
@@ -2444,6 +2495,227 @@ fn merge_workspace_folder_trust(existing: &str) -> Result<String> {
     folders_table.insert("/workspace".to_string(), toml::Value::Table(workspace));
 
     toml::to_string(&root).context("Failed to serialize ~/.grok/trusted_folders.toml")
+}
+
+/// The guest omp agent directory, relative to the guest user's home.
+const OMP_GUEST_DIR: &str = ".omp/agent";
+
+/// Top-level files copied verbatim from the host omp agent dir. The
+/// `agent.db` credential store is handled by [`stage_omp_files`].
+const OMP_ALLOWED_FILES: &[&str] = &[
+    "AGENTS.md",
+    "SYSTEM.md",
+    "APPEND_SYSTEM.md",
+    "RULES.md",
+    "config.yml",
+    "models.yml",
+    "lsp.json",
+    "keybindings.yml",
+];
+const OMP_ALLOWED_DIRS: &[&str] = &[
+    "skills",
+    "rules",
+    "commands",
+    "prompts",
+    "instructions",
+    "hooks",
+    "tools",
+    "extensions",
+    "agents",
+];
+
+/// omp's `SQLite` credential store. It runs in WAL mode, so committed writes
+/// (such as a fresh `/login`) may still sit in the `-wal` sidecar.
+const OMP_AGENT_DB: &str = "agent.db";
+const OMP_AGENT_DB_WAL: &str = "agent.db-wal";
+
+const OMP_MCP_READ_COMMAND: &str = concat!(
+    "test -x ~/.omp/agent || exit 1; ",
+    "if [ -e ~/.omp/agent/mcp.json ] || [ -L ~/.omp/agent/mcp.json ]; then ",
+    "cat -- ~/.omp/agent/mcp.json; fi"
+);
+
+fn copy_omp_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> {
+    let Some(source_dir) = resolve_config_source_dir(config_dir, OMP_GUEST_DIR, "omp.config_dir")
+    else {
+        return Ok(());
+    };
+
+    let staged = stage_omp_files(&source_dir).context("Failed to stage omp config files")?;
+    let copies_db = staged.path().join(OMP_AGENT_DB).is_file();
+    if copies_db {
+        // A guest WAL left by an earlier boot would be replayed onto the
+        // freshly copied database, so drop it (and its index) first.
+        target
+            .exec(
+                RemoteCommand::new()
+                    .literal("rm -f ~/.omp/agent/agent.db-wal ~/.omp/agent/agent.db-shm"),
+            )
+            .context("Failed to clear the guest omp credential store WAL")?;
+    }
+    copy_staged_to_guest(target, &staged, OMP_GUEST_DIR, "omp")?;
+    if copies_db {
+        restrict_guest_omp_credentials(target)?;
+    }
+    Ok(())
+}
+
+/// Stage the omp allowlist plus the credential store. `agent.db-wal` is
+/// staged only with `agent.db`: a WAL without its database is meaningless.
+fn stage_omp_files(source_dir: &Path) -> Result<tempfile::TempDir> {
+    let staged = stage_selected_files(
+        source_dir,
+        OMP_ALLOWED_FILES,
+        OMP_ALLOWED_DIRS,
+        TreeCopy::SkipHostTrees,
+    )?;
+    if source_dir.join(OMP_AGENT_DB).is_file() {
+        let db_files: &[&str] = if source_dir.join(OMP_AGENT_DB_WAL).is_file() {
+            &[OMP_AGENT_DB, OMP_AGENT_DB_WAL]
+        } else {
+            &[OMP_AGENT_DB]
+        };
+        stage_selected_files_into(
+            source_dir,
+            staged.path(),
+            db_files,
+            &[],
+            TreeCopy::SkipHostTrees,
+        )?;
+    }
+    Ok(staged)
+}
+
+/// Owner-only mode for the copied omp credential store. `scp` without `-p`
+/// creates guest files with the remote umask (typically 0644).
+fn restrict_guest_omp_credentials(target: &SshTarget) -> Result<()> {
+    target
+        .exec(RemoteCommand::new().literal(
+            "chmod 0600 ~/.omp/agent/agent.db && \
+             { [ ! -e ~/.omp/agent/agent.db-wal ] || chmod 0600 ~/.omp/agent/agent.db-wal; }",
+        ))
+        .context("Failed to restrict guest ~/.omp/agent/agent.db to owner-only")
+}
+
+/// Merge host and coop-configured MCP servers into the guest
+/// `~/.omp/agent/mcp.json`. Leaves the guest file untouched when there is
+/// nothing to merge.
+fn write_managed_omp_mcp(
+    target: &SshTarget,
+    config_dir: &ConfigDir,
+    mcp_servers: &std::collections::HashMap<String, McpServerDef>,
+) -> Result<()> {
+    let host = read_host_omp_mcp_json(config_dir)?;
+    if host.trim().is_empty() && mcp_servers.is_empty() {
+        return Ok(());
+    }
+
+    target.exec(RemoteCommand::new().literal("mkdir -p ~/.omp/agent"))?;
+    let existing = target
+        .capture(OMP_MCP_READ_COMMAND)
+        .context("Failed to read guest ~/.omp/agent/mcp.json")?;
+    let resolved = resolve_mcp_header_secrets("omp MCP server", mcp_servers)?;
+    let merged = merge_omp_mcp_json(&existing, &host, &resolved)?;
+
+    // mktemp creates the file 0600, which keeps resolved header secrets
+    // owner-only after the rename.
+    target
+        .exec_with_stdin(
+            RemoteCommand::new().literal(
+                "t=\"$(mktemp ~/.omp/agent/mcp.json.XXXXXX)\" && \
+                 cat > \"$t\" && mv \"$t\" ~/.omp/agent/mcp.json",
+            ),
+            merged.into_bytes(),
+        )
+        .context("Failed to write managed ~/.omp/agent/mcp.json")?;
+    Ok(())
+}
+
+/// Read the host `mcp.json` whose servers are merged into the guest file.
+/// Missing or disabled config is empty; a present but unreadable file is
+/// an error.
+fn read_host_omp_mcp_json(config_dir: &ConfigDir) -> Result<String> {
+    let Some(source_dir) = resolve_config_source_dir(config_dir, OMP_GUEST_DIR, "omp.config_dir")
+    else {
+        return Ok(String::new());
+    };
+    let path = source_dir.join("mcp.json");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e).with_context(|| format!("Failed to read host {}", path.display())),
+    }
+}
+
+/// Merge MCP servers into an omp `mcp.json` document.
+///
+/// `existing` (the guest file) is the base and keeps every key it has.
+/// Host `mcpServers` entries replace guest entries of the same name, then
+/// `servers` from coop config replace either. Stdio `env` values in coop
+/// config name host variables, so they are written as `${NAME}` for omp to
+/// expand from the guest environment. Empty input is an empty document; a
+/// parse failure is an error.
+fn merge_omp_mcp_json(
+    existing: &str,
+    host: &str,
+    servers: &std::collections::HashMap<String, McpServerDef>,
+) -> Result<String> {
+    let mut root = parse_omp_mcp_object(existing, "existing ~/.omp/agent/mcp.json")?;
+    let host_root = parse_omp_mcp_object(host, "host ~/.omp/agent/mcp.json")?;
+
+    let entry = root
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let merged = entry
+        .as_object_mut()
+        .context("`mcpServers` in ~/.omp/agent/mcp.json is not an object")?;
+
+    if let Some(host_servers) = host_root.get("mcpServers") {
+        let host_servers = host_servers
+            .as_object()
+            .context("`mcpServers` in host ~/.omp/agent/mcp.json is not an object")?;
+        for (name, def) in host_servers {
+            merged.insert(name.clone(), def.clone());
+        }
+    }
+
+    let mut names: Vec<&String> = servers.keys().collect();
+    names.sort_unstable();
+    for name in names {
+        let Some(def) = servers.get(name) else {
+            continue;
+        };
+        let mut value = serde_json::to_value(def).context("Failed to serialize omp MCP server")?;
+        if let Some(env) = value
+            .get_mut("env")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for host_name in env.values_mut() {
+                if let Some(name) = host_name.as_str() {
+                    *host_name = serde_json::Value::String(format!("${{{name}}}"));
+                }
+            }
+        }
+        merged.insert(name.clone(), value);
+    }
+
+    let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(root))
+        .context("Failed to serialize managed ~/.omp/agent/mcp.json")?;
+    text.push('\n');
+    Ok(text)
+}
+
+fn parse_omp_mcp_object(
+    text: &str,
+    label: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    if text.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    match serde_json::from_str(text).with_context(|| format!("{label} is not valid JSON"))? {
+        serde_json::Value::Object(map) => Ok(map),
+        _ => bail!("{label} is not a JSON object"),
+    }
 }
 
 /// Copy every entry staged in `staged` into the guest's `~/<guest_subdir>/`,
@@ -3743,8 +4015,8 @@ const GUEST_MARKETPLACE_DIR: &str = "~/.coop/marketplaces";
 /// and its guest-side path is returned; a URL / GitHub slug / `owner/repo`
 /// shorthand is passed through unchanged. `made_dir` tracks whether the
 /// guest marketplace dir has been created yet so it is only `mkdir -p`'d
-/// once per install pass. Shared by the Claude and Codex marketplace
-/// installers; `tool` (`"claude"` / `"codex"` / `"grok"`) namespaces the
+/// once per install pass. Shared by every agent's marketplace installer;
+/// `tool` (`"claude"` / `"codex"` / `"grok"` / `"omp"`) namespaces the
 /// copy dir so two local marketplaces with the same directory basename —
 /// one per agent — do not overwrite each other in the guest.
 fn stage_marketplace_source(
@@ -3801,6 +4073,7 @@ pub(crate) fn install_agent_plugins(
             AgentKind::Claude => install_marketplaces(session, bin, marketplaces)?,
             AgentKind::Codex => install_codex_marketplaces(session, bin, marketplaces)?,
             AgentKind::Grok => install_grok_marketplaces(session, bin, marketplaces)?,
+            AgentKind::Omp => install_omp_marketplaces(session, bin, marketplaces)?,
         }
     }
     if !plugins.is_empty() {
@@ -3808,6 +4081,7 @@ pub(crate) fn install_agent_plugins(
             AgentKind::Claude => install_plugins(session, bin, plugins)?,
             AgentKind::Codex => install_codex_plugins(session, bin, plugins)?,
             AgentKind::Grok => install_grok_plugins(session, bin, plugins)?,
+            AgentKind::Omp => install_omp_plugins(session, bin, plugins)?,
         }
     }
     Ok(())
@@ -3941,6 +4215,49 @@ fn install_grok_plugins(
         session
             .exec(cmd)
             .with_context(|| format!("Failed to install Grok Build plugin '{plugin}'"))?;
+    }
+    Ok(())
+}
+
+/// Register omp marketplaces via `omp plugin marketplace add`. omp reads
+/// Claude Code-compatible catalogs. Local directories are copied into the
+/// guest first, mirroring [`install_marketplaces`].
+fn install_omp_marketplaces(
+    session: &SshSession,
+    omp_bin: &GuestPath,
+    marketplaces: &[String],
+) -> Result<()> {
+    let mut made_dir = false;
+    for source in marketplaces {
+        let guest_source = stage_marketplace_source(session, "omp", source, &mut made_dir)?;
+        tracing::info!("Adding omp marketplace: {guest_source}");
+        let cmd = RemoteCommand::new()
+            .arg(omp_bin)
+            .literal(" plugin marketplace add ")
+            .arg(&guest_source);
+        session
+            .exec(cmd)
+            .with_context(|| format!("Failed to add omp marketplace '{source}'"))?;
+    }
+    Ok(())
+}
+
+/// Install omp plugins (`name@marketplace`) at user scope via
+/// `omp plugin install --scope user`.
+fn install_omp_plugins(
+    session: &SshSession,
+    omp_bin: &GuestPath,
+    plugins: &[String],
+) -> Result<()> {
+    for plugin in plugins {
+        tracing::info!("Installing omp plugin: {plugin}");
+        let cmd = RemoteCommand::new()
+            .arg(omp_bin)
+            .literal(" plugin install --scope user ")
+            .arg(plugin);
+        session
+            .exec(cmd)
+            .with_context(|| format!("Failed to install omp plugin '{plugin}'"))?;
     }
     Ok(())
 }
@@ -6191,6 +6508,7 @@ url = "https://example.com/m"
         (cfg.claude.marketplaces, cfg.claude.plugins) = lists("claude");
         (cfg.codex.marketplaces, cfg.codex.plugins) = lists("codex");
         (cfg.grok.marketplaces, cfg.grok.plugins) = lists("grok");
+        (cfg.omp.marketplaces, cfg.omp.plugins) = lists("omp");
         let image = ImageName::new("default").unwrap();
 
         std::fs::create_dir_all(cfg.image_dir(&image)).unwrap();
@@ -6201,12 +6519,14 @@ url = "https://example.com/m"
             "profiles": [],
             "extra_packages": [],
             "post_install_hash": null,
-            "marketplaces": ["claude-baked", "codex-new", "grok-new"],
-            "plugins": ["claude-p-baked", "codex-p-new", "grok-p-new"],
-            "codex_marketplaces": ["codex-baked", "claude-new", "grok-new"],
-            "codex_plugins": ["codex-p-baked", "claude-p-new", "grok-p-new"],
-            "grok_marketplaces": ["grok-baked", "claude-new", "codex-new"],
-            "grok_plugins": ["grok-p-baked", "claude-p-new", "codex-p-new"]
+            "marketplaces": ["claude-baked", "codex-new", "grok-new", "omp-new"],
+            "plugins": ["claude-p-baked", "codex-p-new", "grok-p-new", "omp-p-new"],
+            "codex_marketplaces": ["codex-baked", "claude-new", "grok-new", "omp-new"],
+            "codex_plugins": ["codex-p-baked", "claude-p-new", "grok-p-new", "omp-p-new"],
+            "grok_marketplaces": ["grok-baked", "claude-new", "codex-new", "omp-new"],
+            "grok_plugins": ["grok-p-baked", "claude-p-new", "codex-p-new", "omp-p-new"],
+            "omp_marketplaces": ["omp-baked", "claude-new", "codex-new", "grok-new"],
+            "omp_plugins": ["omp-p-baked", "claude-p-new", "codex-p-new", "grok-p-new"]
         }"#;
         std::fs::write(cfg.template_config_path_for(&image), json).unwrap();
 
@@ -6214,6 +6534,7 @@ url = "https://example.com/m"
             (AgentKind::Claude, "claude"),
             (AgentKind::Codex, "codex"),
             (AgentKind::Grok, "grok"),
+            (AgentKind::Omp, "omp"),
         ] {
             let (missing_m, missing_p) = compute_plugin_delta(&cfg, &image, agent);
             assert_eq!(missing_m, [format!("{name}-new")], "{agent:?}");
@@ -6236,6 +6557,142 @@ url = "https://example.com/m"
         let (missing_m, missing_p) = compute_plugin_delta(&cfg, &image, AgentKind::Grok);
         assert_eq!(missing_m, ["m"]);
         assert_eq!(missing_p, ["p@m"]);
+    }
+
+    fn omp_stdio(command: &str, env: &[(&str, &str)]) -> McpServerDef {
+        McpServerDef::Stdio {
+            command: command.into(),
+            args: vec!["--flag".into()],
+            env: env
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        crate::guest_env_state::EnvVarName::new(k).unwrap(),
+                        crate::guest_env_state::EnvVarName::new(v).unwrap(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn merge_omp_mcp_json_writes_servers_with_env_references() {
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "tool".to_string(),
+            omp_stdio("npx", &[("TOKEN", "HOST_TOKEN")]),
+        );
+        servers.insert(
+            "docs".to_string(),
+            McpServerDef::Http {
+                url: url::Url::parse("https://example.com/mcp").unwrap(),
+                headers: std::collections::HashMap::from([(
+                    "Authorization".to_string(),
+                    crate::config::Secret::new("Bearer abc".to_string()),
+                )]),
+            },
+        );
+
+        let merged = merge_omp_mcp_json("", "", &servers).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        let tool = &doc["mcpServers"]["tool"];
+        assert_eq!(tool["command"], "npx");
+        assert_eq!(tool["args"], serde_json::json!(["--flag"]));
+        assert_eq!(tool["env"]["TOKEN"], "${HOST_TOKEN}");
+        let docs = &doc["mcpServers"]["docs"];
+        assert_eq!(docs["type"], "http");
+        assert_eq!(docs["url"], "https://example.com/mcp");
+        assert_eq!(docs["headers"]["Authorization"], "Bearer abc");
+    }
+
+    #[test]
+    fn merge_omp_mcp_json_layers_guest_then_host_then_coop_config() {
+        let existing = r#"{
+            "$schema": "https://example.com/schema.json",
+            "mcpServers": {
+                "guest-only": {"command": "guest-tool"},
+                "shared": {"command": "guest"}
+            }
+        }"#;
+        let host =
+            r#"{"mcpServers": {"shared": {"command": "host"}, "both": {"command": "host"}}}"#;
+        let servers =
+            std::collections::HashMap::from([("both".to_string(), omp_stdio("coop", &[]))]);
+
+        let merged = merge_omp_mcp_json(existing, host, &servers).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(doc["$schema"], "https://example.com/schema.json");
+        assert_eq!(doc["mcpServers"]["guest-only"]["command"], "guest-tool");
+        assert_eq!(doc["mcpServers"]["shared"]["command"], "host");
+        assert_eq!(doc["mcpServers"]["both"]["command"], "coop");
+    }
+
+    #[test]
+    fn merge_omp_mcp_json_rejects_malformed_documents() {
+        let none = std::collections::HashMap::new();
+        for (existing, host) in [
+            ("{not json", ""),
+            ("[]", ""),
+            (r#"{"mcpServers": []}"#, ""),
+            ("", "{not json"),
+            ("", r#"{"mcpServers": "x"}"#),
+        ] {
+            assert!(
+                merge_omp_mcp_json(existing, host, &none).is_err(),
+                "existing={existing:?} host={host:?}"
+            );
+        }
+    }
+
+    fn staged_names(staged: &tempfile::TempDir) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(staged.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[test]
+    fn stage_omp_files_copies_allowlist_and_credential_store() {
+        let src = tempfile::TempDir::new().unwrap();
+        for file in [
+            "AGENTS.md",
+            "config.yml",
+            "agent.db",
+            "agent.db-wal",
+            "agent.db-shm",
+            "mcp.json",
+            "secrets.yml",
+        ] {
+            std::fs::write(src.path().join(file), file).unwrap();
+        }
+        for dir in ["skills", "sessions", "cache"] {
+            std::fs::create_dir(src.path().join(dir)).unwrap();
+            std::fs::write(src.path().join(dir).join("x"), "x").unwrap();
+        }
+
+        let staged = stage_omp_files(src.path()).unwrap();
+        assert_eq!(
+            staged_names(&staged),
+            [
+                "AGENTS.md",
+                "agent.db",
+                "agent.db-wal",
+                "config.yml",
+                "skills"
+            ]
+        );
+    }
+
+    #[test]
+    fn stage_omp_files_skips_a_wal_without_its_database() {
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("AGENTS.md"), "a").unwrap();
+        std::fs::write(src.path().join("agent.db-wal"), "wal").unwrap();
+
+        let staged = stage_omp_files(src.path()).unwrap();
+        assert_eq!(staged_names(&staged), ["AGENTS.md"]);
     }
 
     #[test]

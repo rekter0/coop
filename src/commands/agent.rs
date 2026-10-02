@@ -21,6 +21,10 @@
 //! - **Grok Build** lives in the guest user's `~/.grok/bin` and already
 //!   auto-updates in the background. `coop agent update --grok` runs
 //!   `grok update` synchronously as the guest user.
+//! - **omp** lives in the guest user's `~/.local/bin` and only checks for
+//!   updates at startup. `coop agent update --omp` runs `omp update`, which
+//!   downloads and checksums the release binary, as the guest user; `--check`
+//!   compares against the latest GitHub release like Codex.
 
 use std::io::Write as _;
 
@@ -42,8 +46,10 @@ pub(crate) struct AgentUpdateOpts {
     pub yes: bool,
 }
 
-/// The `openai/codex` release feed coop compares the guest binary against.
+/// The release feeds coop compares guest binaries against for agents that
+/// do not update themselves in the background.
 const CODEX_REPO: &str = "openai/codex";
+const OMP_REPO: &str = "can1357/oh-my-pi";
 
 // ── Domain types ──────────────────────────────────────────────
 
@@ -52,7 +58,7 @@ const CODEX_REPO: &str = "openai/codex";
 /// self-update as root or Codex's reinstall without sudo.
 fn strategy(agent: AgentKind) -> UpdateStrategy {
     match agent {
-        AgentKind::Claude | AgentKind::Grok => UpdateStrategy::SelfUpdate,
+        AgentKind::Claude | AgentKind::Grok | AgentKind::Omp => UpdateStrategy::SelfUpdate,
         AgentKind::Codex => UpdateStrategy::ReinstallAsRoot {
             script: guest::SCRIPT_CODEX,
         },
@@ -64,7 +70,7 @@ fn strategy(agent: AgentKind) -> UpdateStrategy {
 fn auto_updates(agent: AgentKind) -> bool {
     match agent {
         AgentKind::Claude | AgentKind::Grok => true,
-        AgentKind::Codex => false,
+        AgentKind::Codex | AgentKind::Omp => false,
     }
 }
 
@@ -132,8 +138,10 @@ impl AgentVersion {
 
     /// Try to read a version out of one whitespace-delimited token, first as
     /// the whole token (minus a leading `v`), then as the suffix after the
-    /// last `v` (for tags such as `rust-v0.42.0`).
+    /// last `v` (for tags such as `rust-v0.42.0`). A `name/` prefix, as in
+    /// omp's `omp/18.4.12`, is dropped first.
     fn from_token(token: &str) -> Option<Version> {
+        let token = token.rsplit_once('/').map_or(token, |(_, rest)| rest);
         let stripped = token.strip_prefix('v').unwrap_or(token);
         if let Ok(v) = Version::parse(stripped) {
             return Some(v);
@@ -329,10 +337,7 @@ fn run_check(session: &SshSession, selection: &AgentSelection) -> Result<()> {
 /// Gather one agent's installed/latest versions and classify them.
 fn check_row(session: &SshSession, agent: AgentKind) -> CheckRow {
     let installed = capture_version(session, agent);
-    let latest = match agent {
-        AgentKind::Claude | AgentKind::Grok => None,
-        AgentKind::Codex => codex_latest(),
-    };
+    let latest = release_repo(agent).and_then(|repo| latest_release(agent, repo));
     let status = check_status(agent, installed.as_ref(), latest.as_ref());
     CheckRow {
         agent,
@@ -342,13 +347,26 @@ fn check_row(session: &SshSession, agent: AgentKind) -> CheckRow {
     }
 }
 
-/// Best-effort lookup of the newest Codex release tag. Network failures
+/// GitHub repo whose newest release `--check` compares against. Agents that
+/// update themselves in the background have none.
+fn release_repo(agent: AgentKind) -> Option<&'static str> {
+    match agent {
+        AgentKind::Claude | AgentKind::Grok => None,
+        AgentKind::Codex => Some(CODEX_REPO),
+        AgentKind::Omp => Some(OMP_REPO),
+    }
+}
+
+/// Best-effort lookup of an agent's newest release tag. Network failures
 /// degrade to `None` (reported as `Unknown`) rather than aborting the check.
-fn codex_latest() -> Option<AgentVersion> {
-    match update::latest_release_tag(CODEX_REPO) {
+fn latest_release(agent: AgentKind, repo: &str) -> Option<AgentVersion> {
+    match update::latest_release_tag(repo) {
         Ok(tag) => AgentVersion::parse(&tag).ok(),
         Err(e) => {
-            tracing::debug!("Failed to look up latest Codex release: {e:#}");
+            tracing::debug!(
+                "Failed to look up latest {} release: {e:#}",
+                agent.display()
+            );
             None
         }
     }
@@ -408,7 +426,10 @@ fn check_line(row: &CheckRow) -> String {
                 .map_or_else(|| "?".to_string(), AgentVersion::to_string);
             (
                 format!("{installed} → {latest}"),
-                "update available — run: coop agent update --codex".to_string(),
+                format!(
+                    "update available — run: coop agent update --{}",
+                    row.agent.cli_name()
+                ),
             )
         }
         CheckStatus::AutoUpdates => (
@@ -454,14 +475,18 @@ mod tests {
 
     #[test]
     fn selection_keeps_named_agents_in_canonical_order() {
-        use AgentKind::{Claude, Codex, Grok};
+        use AgentKind::{Claude, Codex, Grok, Omp};
         assert_eq!(select(&[Claude]).agents(), &[Claude]);
         assert_eq!(select(&[Codex]).agents(), &[Codex]);
         assert_eq!(select(&[Grok]).agents(), &[Grok]);
         assert_eq!(select(&[Claude, Codex]).agents(), &[Claude, Codex]);
         assert_eq!(select(&[Claude, Grok]).agents(), &[Claude, Grok]);
         assert_eq!(select(&[Grok, Codex]).agents(), &[Codex, Grok]);
-        assert_eq!(select(&[Grok, Claude, Codex]).agents(), &AgentKind::ALL);
+        assert_eq!(select(&[Omp, Codex]).agents(), &[Codex, Omp]);
+        assert_eq!(
+            select(&[Omp, Grok, Claude, Codex]).agents(),
+            &AgentKind::ALL
+        );
     }
 
     #[test]
@@ -490,7 +515,7 @@ mod tests {
         );
         assert_eq!(
             selection_phrase(&select(&[])),
-            "Claude Code, Codex, and Grok Build"
+            "Claude Code, Codex, Grok Build, and omp"
         );
     }
 
@@ -506,6 +531,12 @@ mod tests {
     fn parse_extracts_version_from_tool_prefixed_output() {
         assert_eq!(ver("codex-cli 0.5.0"), ver("0.5.0"));
         assert_eq!(ver("claude 1.2.3 (Claude Code)"), ver("1.2.3"));
+    }
+
+    #[test]
+    fn parse_extracts_version_after_a_name_slash() {
+        assert_eq!(ver("omp/18.4.12"), ver("18.4.12"));
+        assert_eq!(ver("omp/v18.4.12"), ver("18.4.12"));
     }
 
     #[test]
@@ -583,7 +614,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn omp_compares_against_its_latest_release() {
+        assert_eq!(
+            check_status(AgentKind::Omp, Some(&ver("18.4.11")), Some(&ver("18.4.12"))),
+            CheckStatus::UpdateAvailable
+        );
+        assert_eq!(
+            check_status(AgentKind::Omp, Some(&ver("18.4.12")), Some(&ver("18.4.12"))),
+            CheckStatus::UpToDate
+        );
+    }
+
+    #[test]
+    fn release_repo_names_only_agents_without_background_updates() {
+        assert_eq!(release_repo(AgentKind::Codex), Some("openai/codex"));
+        assert_eq!(release_repo(AgentKind::Omp), Some("can1357/oh-my-pi"));
+        assert_eq!(release_repo(AgentKind::Claude), None);
+        assert_eq!(release_repo(AgentKind::Grok), None);
+    }
+
     // ── report lines ───────────────────────────────────────────
+
+    #[test]
+    fn check_line_update_available_names_the_agents_flag() {
+        let row = CheckRow {
+            agent: AgentKind::Omp,
+            installed: Some(ver("18.4.11")),
+            latest: Some(ver("18.4.12")),
+            status: CheckStatus::UpdateAvailable,
+        };
+        let line = check_line(&row);
+        assert!(line.contains("coop agent update --omp"), "{line}");
+        assert!(!line.contains("--codex"), "{line}");
+    }
 
     #[test]
     fn check_line_update_available_shows_arrow_and_command() {
@@ -727,6 +791,10 @@ mod tests {
         ));
         assert!(matches!(
             strategy(AgentKind::Grok),
+            UpdateStrategy::SelfUpdate
+        ));
+        assert!(matches!(
+            strategy(AgentKind::Omp),
             UpdateStrategy::SelfUpdate
         ));
     }

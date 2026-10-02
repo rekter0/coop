@@ -1537,6 +1537,10 @@ pub(crate) fn cmd_agent_launch(
             agent.binary(&guest::GuestUser::new(sess.target.user.as_ref())?),
             grok_launch_args(ask, args),
         ),
+        AgentKind::Omp => (
+            agent.binary(&guest::GuestUser::new(sess.target.user.as_ref())?),
+            omp_launch_args(ask, args),
+        ),
     };
     ssh::run_interactive(&sess, &prepend_binary(bin.as_ref(), args))
 }
@@ -1623,6 +1627,27 @@ pub(crate) fn grok_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String> 
         args.insert(0, GROK_PERMISSION_MODE.to_string());
     } else if !is_auth_subcommand {
         args.insert(0, GROK_ALWAYS_APPROVE.to_string());
+    }
+    args
+}
+
+/// omp flags for running without approval prompts, or with them under `--ask`.
+const OMP_YOLO: &str = "--yolo";
+const OMP_APPROVAL_MODE: &str = "--approval-mode";
+const OMP_APPROVAL_ASK: &str = "always-ask";
+
+/// Prepend omp's approval flags. omp already defaults to its `yolo` approval
+/// mode, but a copied host `config.yml` can set a stricter one, so coop
+/// passes `--yolo` explicitly. `ask` selects `--approval-mode always-ask`
+/// instead, which prompts before writes and command execution. omp ignores
+/// launch flags that precede a subcommand, so `coop omp -- login` works
+/// without special-casing.
+pub(crate) fn omp_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String> {
+    if ask {
+        args.insert(0, OMP_APPROVAL_ASK.to_string());
+        args.insert(0, OMP_APPROVAL_MODE.to_string());
+    } else {
+        args.insert(0, OMP_YOLO.to_string());
     }
     args
 }
@@ -2769,6 +2794,21 @@ mod tests {
         assert_eq!(
             args,
             vec!["--permission-mode", "default", "--model", "opus"]
+        );
+    }
+
+    #[test]
+    fn omp_launch_args_yolo_by_default() {
+        let args = super::omp_launch_args(false, vec!["--model".into(), "opus".into()]);
+        assert_eq!(args, vec!["--yolo", "--model", "opus"]);
+    }
+
+    #[test]
+    fn omp_launch_args_ask_selects_always_ask() {
+        let args = super::omp_launch_args(true, vec!["--model".into(), "opus".into()]);
+        assert_eq!(
+            args,
+            vec!["--approval-mode", "always-ask", "--model", "opus"]
         );
     }
 

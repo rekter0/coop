@@ -7,7 +7,7 @@
 //! details, proxy and local-model routing, launch flags) stays in the module
 //! that owns it; this module holds the facts the shared code needs.
 
-use crate::config::CoopConfig;
+use crate::config::{CoopConfig, mcp_stdio_env_host_names};
 use crate::guest::{self, GuestUser, ProfileDef};
 use crate::guest_env_state::EnvVarName;
 use crate::paths::GuestPath;
@@ -18,13 +18,14 @@ pub enum AgentKind {
     Claude,
     Codex,
     Grok,
+    Omp,
 }
 
 impl AgentKind {
     /// Every agent, in install, bootstrap, and update order. The install
     /// order is part of the provisioning script, whose hash decides whether
     /// an existing golden image is stale.
-    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Grok];
+    pub const ALL: [Self; 4] = [Self::Claude, Self::Codex, Self::Grok, Self::Omp];
 
     /// Human-facing label used in prompts, reports, and errors.
     pub fn display(self) -> &'static str {
@@ -32,17 +33,30 @@ impl AgentKind {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex",
             Self::Grok => "Grok Build",
+            Self::Omp => "omp",
         }
     }
 
-    /// Absolute guest path coop invokes for this agent. Claude Code and
-    /// Grok Build live under the guest user's home; Codex uses its system
-    /// compatibility link.
+    /// Name of the agent's `coop <agent>` subcommand and `coop agent update
+    /// --<agent>` flag.
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Grok => "grok",
+            Self::Omp => "omp",
+        }
+    }
+
+    /// Absolute guest path coop invokes for this agent. Claude Code, Grok
+    /// Build, and omp live under the guest user's home; Codex uses its
+    /// system compatibility link.
     pub fn binary(self, user: &GuestUser) -> GuestPath {
         match self {
             Self::Claude => user.claude_bin(),
             Self::Codex => guest::codex_bin(),
             Self::Grok => user.grok_bin(),
+            Self::Omp => user.omp_bin(),
         }
     }
 
@@ -57,13 +71,14 @@ impl AgentKind {
             // user's home; the account wrapper drives the guest keyring.
             Self::Codex => &[guest::SCRIPT_CODEX, guest::SCRIPT_CODEX_ACCOUNT],
             Self::Grok => &[guest::SCRIPT_GROK],
+            Self::Omp => &[guest::SCRIPT_OMP],
         }
     }
 
     /// Binaries the golden image must contain for this agent.
     pub fn required_binaries(self, user: &GuestUser) -> Vec<GuestPath> {
         match self {
-            Self::Claude | Self::Grok => vec![self.binary(user)],
+            Self::Claude | Self::Grok | Self::Omp => vec![self.binary(user)],
             Self::Codex => vec![
                 guest::codex_bin(),
                 guest::codex_code_mode_host_bin(),
@@ -80,16 +95,21 @@ impl AgentKind {
     }
 
     /// Host environment variable names forwarded into the guest for this
-    /// agent: its `env_forward` list, plus the host names that Grok stdio
-    /// MCP `env` mappings reference (Grok expands them as `${NAME}` in the
-    /// guest config, so they must exist there).
+    /// agent: its `env_forward` list, plus the host names that Grok and omp
+    /// stdio MCP `env` mappings reference (both expand them as `${NAME}` in
+    /// the guest config, so they must exist there).
     pub fn env_forward_names(self, cfg: &CoopConfig) -> Vec<EnvVarName> {
         match self {
             Self::Claude => cfg.claude.env_forward.clone(),
             Self::Codex => cfg.codex.env_forward.clone(),
             Self::Grok => {
                 let mut names = cfg.grok.env_forward.clone();
-                names.extend(cfg.grok.stdio_env_host_names());
+                names.extend(mcp_stdio_env_host_names(&cfg.grok.mcp_servers));
+                names
+            }
+            Self::Omp => {
+                let mut names = cfg.omp.env_forward.clone();
+                names.extend(mcp_stdio_env_host_names(&cfg.omp.mcp_servers));
                 names
             }
         }
@@ -102,6 +122,7 @@ impl AgentKind {
             Self::Claude => (&cfg.claude.marketplaces, &cfg.claude.plugins),
             Self::Codex => (&cfg.codex.marketplaces, &cfg.codex.plugins),
             Self::Grok => (&cfg.grok.marketplaces, &cfg.grok.plugins),
+            Self::Omp => (&cfg.omp.marketplaces, &cfg.omp.plugins),
         }
     }
 
@@ -124,7 +145,7 @@ impl AgentKind {
                     plugins.extend(def.plugins.iter().cloned());
                 }
             }
-            Self::Codex | Self::Grok => {}
+            Self::Codex | Self::Grok | Self::Omp => {}
         }
 
         marketplaces.sort_unstable();
@@ -157,6 +178,13 @@ mod tests {
         assert_eq!(AgentKind::Claude.display(), "Claude Code");
         assert_eq!(AgentKind::Codex.display(), "Codex");
         assert_eq!(AgentKind::Grok.display(), "Grok Build");
+        assert_eq!(AgentKind::Omp.display(), "omp");
+    }
+
+    #[test]
+    fn cli_name_matches_each_subcommand() {
+        let names: Vec<&str> = AgentKind::ALL.iter().map(|a| a.cli_name()).collect();
+        assert_eq!(names, ["claude", "codex", "grok", "omp"]);
     }
 
     #[test]
@@ -173,6 +201,10 @@ mod tests {
         assert_eq!(
             AgentKind::Grok.binary(&user).to_string(),
             "/home/dev/.grok/bin/grok"
+        );
+        assert_eq!(
+            AgentKind::Omp.binary(&user).to_string(),
+            "/home/dev/.local/bin/omp"
         );
     }
 
@@ -192,6 +224,7 @@ mod tests {
                 guest::SCRIPT_CODEX,
                 guest::SCRIPT_CODEX_ACCOUNT,
                 guest::SCRIPT_GROK,
+                guest::SCRIPT_OMP,
             ]
         );
     }
@@ -208,6 +241,7 @@ mod tests {
         };
         assert_eq!(paths(AgentKind::Claude), ["/home/ubuntu/.local/bin/claude"]);
         assert_eq!(paths(AgentKind::Grok), ["/home/ubuntu/.grok/bin/grok"]);
+        assert_eq!(paths(AgentKind::Omp), ["/home/ubuntu/.local/bin/omp"]);
         assert_eq!(
             paths(AgentKind::Codex),
             [
@@ -227,6 +261,7 @@ mod tests {
         cfg.claude.env_forward = vec![EnvVarName::new("CLAUDE_ONLY").unwrap()];
         cfg.codex.env_forward = vec![EnvVarName::new("CODEX_ONLY").unwrap()];
         cfg.grok.env_forward = vec![EnvVarName::new("GROK_ONLY").unwrap()];
+        cfg.omp.env_forward = vec![EnvVarName::new("OMP_ONLY").unwrap()];
         let mut env = std::collections::BTreeMap::new();
         env.insert(
             EnvVarName::new("TOKEN").unwrap(),
@@ -240,6 +275,19 @@ mod tests {
                 env,
             },
         );
+        let mut omp_env = std::collections::BTreeMap::new();
+        omp_env.insert(
+            EnvVarName::new("TOKEN").unwrap(),
+            EnvVarName::new("OMP_MCP_HOST").unwrap(),
+        );
+        cfg.omp.mcp_servers.insert(
+            "tool".into(),
+            crate::config::McpServerDef::Stdio {
+                command: "npx".into(),
+                args: vec![],
+                env: omp_env,
+            },
+        );
 
         let names = |agent: AgentKind| -> Vec<String> {
             agent
@@ -251,6 +299,7 @@ mod tests {
         assert_eq!(names(AgentKind::Claude), ["CLAUDE_ONLY"]);
         assert_eq!(names(AgentKind::Codex), ["CODEX_ONLY"]);
         assert_eq!(names(AgentKind::Grok), ["GROK_ONLY", "GROK_MCP_HOST"]);
+        assert_eq!(names(AgentKind::Omp), ["OMP_ONLY", "OMP_MCP_HOST"]);
     }
 
     #[test]
@@ -262,11 +311,14 @@ mod tests {
         cfg.codex.plugins = vec!["codex-p".into()];
         cfg.grok.marketplaces = vec!["grok-m".into()];
         cfg.grok.plugins = vec!["grok-p".into()];
+        cfg.omp.marketplaces = vec!["omp-m".into()];
+        cfg.omp.plugins = vec!["omp-p".into()];
 
         let expected = [
             (AgentKind::Claude, "claude-m", "claude-p"),
             (AgentKind::Codex, "codex-m", "codex-p"),
             (AgentKind::Grok, "grok-m", "grok-p"),
+            (AgentKind::Omp, "omp-m", "omp-p"),
         ];
         for (agent, marketplace, plugin) in expected {
             let (marketplaces, plugins) = agent.configured_plugins(&cfg);
@@ -290,12 +342,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_and_grok_baked_lists_ignore_profiles() {
+    fn non_claude_baked_lists_ignore_profiles() {
         let mut cfg = CoopConfig::default();
         cfg.codex.marketplaces = vec!["b".into(), "a".into(), "a".into()];
         cfg.codex.plugins = vec!["p2@b".into(), "p1@a".into(), "p2@b".into()];
         cfg.grok.marketplaces = vec!["d".into(), "c".into(), "c".into()];
         cfg.grok.plugins = vec!["p4@d".into(), "p3@c".into(), "p4@d".into()];
+        cfg.omp.marketplaces = vec!["f".into(), "e".into(), "e".into()];
+        cfg.omp.plugins = vec!["p6@f".into(), "p5@e".into(), "p6@f".into()];
         let profiles = [profile(&["profile-m"], &["profile-p"])];
 
         let (marketplaces, plugins) = AgentKind::Codex.baked_lists(&cfg, &profiles);
@@ -305,5 +359,9 @@ mod tests {
         let (marketplaces, plugins) = AgentKind::Grok.baked_lists(&cfg, &profiles);
         assert_eq!(marketplaces, ["c", "d"]);
         assert_eq!(plugins, ["p3@c", "p4@d"]);
+
+        let (marketplaces, plugins) = AgentKind::Omp.baked_lists(&cfg, &profiles);
+        assert_eq!(marketplaces, ["e", "f"]);
+        assert_eq!(plugins, ["p5@e", "p6@f"]);
     }
 }

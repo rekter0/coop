@@ -1,6 +1,6 @@
 # Command Reference
 
-coop creates isolated VM environments for running Claude Code, Codex, and Grok Build. It runs Firecracker microVMs on Linux and Lima VMs on macOS, selecting the backend automatically based on platform.
+coop creates isolated VM environments for running Claude Code, Codex, Grok Build, and omp. It runs Firecracker microVMs on Linux and Lima VMs on macOS, selecting the backend automatically based on platform.
 
 ## Global Flags
 
@@ -58,7 +58,7 @@ Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
 | `--vcpus <N>` | Number of vCPUs when creating a new instance |
 | `--mem <MiB>` | Memory in MiB when creating a new instance |
 | `--disk <GiB>` | Instance disk size when creating a new instance |
-| `--no-agents` | Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM |
+| `--no-agents` | Skip injecting Claude Code, Codex, Grok Build, and omp credentials/config into the VM |
 | `--no-github` | Use `github = "off"` for this invocation and suppress the PAT setup prompt. See [scope and limitations](configuration.md#github-auth). |
 | `--image <name>` | Named image to use when creating a new instance (default: `default`) |
 | `--profile <list>` | Build or reuse a profile-derived image when creating a new instance, named from the sorted profiles (for example `node-python`) |
@@ -245,7 +245,7 @@ instances, pass the instance name.
 |------|-------------|
 | `NAME` | Stopped instance name (optional only when exactly one stopped instance exists) |
 | `--workspace <dir>` | Restart the stopped instance associated with this project path |
-| `--no-agents` | Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM |
+| `--no-agents` | Skip injecting Claude Code, Codex, Grok Build, and omp credentials/config into the VM |
 | `--no-github` | Use `github = "off"` for this invocation and suppress the PAT setup prompt. See [scope and limitations](configuration.md#github-auth). |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable). Lives for the lifetime of the VM; torn down on `coop stop`. |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
@@ -390,6 +390,34 @@ coop grok my-project -- --model grok-4.6
 coop grok my-project -- login --device-auth
 ```
 
+### `omp`
+
+Launch omp (oh-my-pi) inside the VM. By default coop passes `--yolo`, so omp
+runs without approval prompts; the VM is the isolation boundary. Use `--ask`
+to restore prompts for that session (coop passes
+`--approval-mode always-ask`). omp ignores launch flags that precede a
+subcommand, so `coop omp -- login` works unchanged. Host
+`~/.omp/agent/agent.db` (omp's credential store) is copied into the guest on
+boot when `config_dir` is enabled and set to owner-only (`0600`). See
+[omp integration](omp-integration.md).
+
+```
+coop omp [NAME] [FLAGS] [ARGS...]
+```
+
+| Flag | Description |
+|------|-------------|
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--ask` | Prompt before writes and command execution instead of skipping approvals |
+| `ARGS...` | Extra arguments passed through to `omp` |
+
+```
+coop omp
+coop omp my-project --ask
+coop omp my-project -- --model opus
+coop omp my-project -- login
+```
+
 ### `exec`
 
 Run a command in the VM and print its output. No PTY is allocated and stdin is not forwarded; use `shell` for interactive work.
@@ -499,14 +527,14 @@ $ coop status my-project --json
 
 ### `agent update`
 
-Update the coding agents (Claude Code, Codex, and Grok Build) installed inside
+Update the coding agents (Claude Code, Codex, Grok Build, and omp) installed inside
 a running VM to their latest versions, without rebuilding the golden image. The
 agents are installed "latest at build time" during `coop setup`, so they can go
 stale in long-running VMs and in new VMs created from an old image. To refresh
 the image itself instead, rebuild it with `coop setup --rebuild`.
 
 ```
-coop agent update [NAME] [--claude] [--codex] [--grok] [--check] [-y]
+coop agent update [NAME] [--claude] [--codex] [--grok] [--omp] [--check] [-y]
 ```
 
 | Argument / Flag | Description |
@@ -515,6 +543,7 @@ coop agent update [NAME] [--claude] [--codex] [--grok] [--check] [-y]
 | `--claude` | Update Claude Code |
 | `--codex` | Update Codex |
 | `--grok` | Update Grok Build |
+| `--omp` | Update omp |
 | `--check` | Only report installed vs. latest versions — change nothing |
 | `-y`, `--yes` | Skip the confirmation prompt |
 
@@ -530,15 +559,19 @@ without sudo.
 Claude Code and Grok Build already auto-update in the background;
 `coop agent update --claude` / `--grok` run `claude update` / `grok update`
 now, synchronously — a convenience rather than a fix.
+`coop agent update --omp` runs `omp update` as the guest user, which downloads
+the latest release binary and checks its SHA-256 before replacing
+`~/.local/bin/omp`; omp only checks for updates at startup.
 
-`--check` reports each agent's installed version and, for Codex, the latest
-release on GitHub, changing nothing:
+`--check` reports each agent's installed version and, for Codex and omp, the
+latest release on GitHub, changing nothing:
 
 ```
 $ coop agent update my-project --check
 Claude Code  1.2.3            up to date (auto-updates in background)
 Codex        0.4.1 → 0.5.0    update available — run: coop agent update --codex
 Grok Build   1.0.24           up to date (auto-updates in background)
+omp          18.4.12          up to date
 ```
 
 ```
@@ -546,6 +579,7 @@ coop agent update                 # every agent, resolved instance
 coop agent update my-project      # every agent, instance "my-project"
 coop agent update --codex         # Codex only
 coop agent update --grok          # Grok Build only
+coop agent update --omp           # omp only
 coop agent update --check         # report versions, change nothing
 ```
 
@@ -845,7 +879,7 @@ coop restore [NAME] [--image <name>] [--reprovision] [-y] [--no-agents] [--no-pr
 | `--image <name>` | Image to restore from. Required on its own; with `--reprovision` it defaults to the image the instance already records |
 | `--reprovision` | Provision the new disk as a first boot and leave the instance running (see below) |
 | `-y`, `--yes` | Skip the `--reprovision` confirmation prompt (required when stdin is not a TTY). Requires `--reprovision` |
-| `--no-agents` | Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM. Requires `--reprovision` |
+| `--no-agents` | Skip injecting Claude Code, Codex, Grok Build, and omp credentials/config into the VM. Requires `--reprovision` |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT. Requires `--reprovision` |
 
 Unlike `destroy` + `up --image`, `restore` keeps the same instance identity (name, index, IP) instead of allocating a new one. The disk is reset to the image's size, so restoring an image built before a `coop resize` returns the instance to the smaller size.

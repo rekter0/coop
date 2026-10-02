@@ -4,7 +4,7 @@ coop reads configuration from `~/.coop/config.toml` by default. Pass `--config <
 
 If the file does not exist, coop falls back to built-in defaults. A valid minimal config is an empty file.
 
-A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, `grok.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `grok.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
+A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, `grok.config_dir`, `omp.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `grok.marketplaces` / `omp.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
 
 Run `coop validate` to surface errors and warnings before anything touches a VM.
 
@@ -353,6 +353,20 @@ Grok Build configuration injected into the guest VM at start time. Every field i
 | `mcp_servers` | table | `{}` | MCP servers to merge into the guest `~/.grok/config.toml`. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
 
 coop also writes `ui.permission_mode = "always-approve"` into the guest `~/.grok/config.toml`, drops the host `[plugins]` table (those names resolve through `installed-plugins/`), keeps the guest `[plugins]` table, and records `/workspace` in `~/.grok/trusted_folders.toml`. Other keys already on the guest, plus host keys that are not `[plugins]`, are preserved. A copied host `auth.json` is set to owner-only (`0600`) on the guest and signs the guest in; otherwise use `coop grok -- login --device-auth`.
+
+## `omp` section
+
+omp (oh-my-pi) configuration injected into the guest VM at start time. Every field is optional. omp has no `api_key` field: it reads provider keys from the environment, and `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `XAI_API_KEY` are already forwarded through the `claude`, `codex`, and `grok` sections.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `config_dir` | string (path) or `false` | `~/.omp/agent` | Source for `AGENTS.md`, `SYSTEM.md`, `APPEND_SYSTEM.md`, `RULES.md`, `config.yml`, `models.yml`, `lsp.json`, `keybindings.yml`, the `agent.db` credential store (with its `agent.db-wal` journal), and `skills/`, `rules/`, `commands/`, `prompts/`, `instructions/`, `hooks/`, `tools/`, `extensions/`, `agents/`, overlaid into guest `~/.omp/agent/` on each start. Host `mcp.json` servers are merged into the guest file. Directory symlinks, hidden directories, and bare git repos stay on the host. Supports `~` expansion; `false` stops copying while retaining prior files. Host deletions do not delete guest files. See [config directory](omp-integration.md#config-directory). |
+| `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`, such as `OPENROUTER_API_KEY` or `GEMINI_API_KEY`. |
+| `marketplaces` | array of strings | `[]` | omp plugin marketplace sources (Claude Code-compatible catalogs). Each entry is a `owner/repo` shorthand, a git URL, or an absolute local directory path. Local directories are copied into the guest before registration. Baked into the golden image and delta-installed on first boot. |
+| `plugins` | array of strings | `[]` | omp plugins to install from registered marketplaces (`omp plugin install --scope user <name@marketplace>`). |
+| `mcp_servers` | table | `{}` | MCP servers to merge into the guest `~/.omp/agent/mcp.json`, replacing same-named guest and host entries. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
+
+A copied host `agent.db` is set to owner-only (`0600`) on the guest and signs the guest in with every provider stored there; any older guest `agent.db-wal` is removed first. Otherwise sign in with `coop omp -- login`.
 
 ## Local-model routing
 

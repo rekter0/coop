@@ -21,6 +21,19 @@
   `coop setup --rebuild`; existing VMs also need
   `coop restore <vm> --image <image> --reprovision` (or destroy/recreate)
   to pick up the new binary.
+- **omp** — `coop omp` launches [omp](https://github.com/can1357/oh-my-pi)
+  (oh-my-pi) inside the guest with `--yolo`; `--ask` passes
+  `--approval-mode always-ask`. The golden image installs the latest
+  `omp-linux-<arch>` release binary at `~/.local/bin/omp` after checking it
+  against that release's `SHA256SUMS.txt`, plus an `omp-yolo` shortcut.
+  `[omp]` copies an allowlist from `config_dir` (default `~/.omp/agent`),
+  including the `agent.db` credential store (set to `0600`), merges host
+  `mcp.json` and `[omp.mcp_servers]` into the guest `mcp.json`, forwards
+  `env_forward` provider keys, and installs configured marketplaces/plugins on
+  first boot. `coop agent update --omp` runs `omp update`, and
+  `--check` compares omp against its latest GitHub release. Existing images
+  need `coop setup --rebuild`; existing VMs also need
+  `coop restore <vm> --image <image> --reprovision` (or destroy/recreate).
 
 ## v0.6.0
 

@@ -89,7 +89,7 @@ use commands::{
 
 #[derive(Parser)]
 #[command(name = "coop", version = env!("COOP_VERSION_STR"))]
-#[command(about = "Isolated VM environment for running Claude Code, Codex, and Grok Build")]
+#[command(about = "Isolated VM environment for running Claude Code, Codex, Grok Build, and omp")]
 pub(crate) struct Cli {
     /// Path to coop config file
     #[arg(long, default_value_os_t = config::CoopConfig::default_path())]
@@ -157,7 +157,7 @@ enum Commands {
         /// Instance disk size in GiB (only used when creating a new instance)
         #[arg(long, value_parser = config::GiB::parse_cli)]
         disk: Option<config::GiB>,
-        /// Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM
+        /// Skip injecting Claude Code, Codex, Grok Build, and omp credentials/config into the VM
         #[arg(long, alias = "no-claude")]
         no_agents: bool,
         /// Use github = "off" for this invocation and skip the GitHub PAT prompt
@@ -313,7 +313,7 @@ enum Commands {
         /// Project directory used to select an associated stopped instance
         #[arg(long)]
         workspace: Option<String>,
-        /// Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM
+        /// Skip injecting Claude Code, Codex, Grok Build, and omp credentials/config into the VM
         #[arg(long, alias = "no-claude")]
         no_agents: bool,
         /// Use github = "off" for this invocation and skip the GitHub PAT prompt
@@ -427,6 +427,21 @@ enum Commands {
         #[arg(long)]
         ask: bool,
         /// Extra arguments passed to `grok`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Launch omp (oh-my-pi) inside the VM (yolo approval mode by default)
+    Omp {
+        /// Instance name (required if multiple instances exist)
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
+        /// Prompt before writes and command execution instead of skipping approvals
+        #[arg(long)]
+        ask: bool,
+        /// Extra arguments passed to `omp`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -671,7 +686,7 @@ enum Commands {
         /// Skip the --reprovision confirmation prompt (required off a TTY)
         #[arg(short = 'y', long, requires = "reprovision")]
         yes: bool,
-        /// Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM
+        /// Skip injecting Claude Code, Codex, Grok Build, and omp credentials/config into the VM
         #[arg(long, alias = "no-claude", requires = "reprovision")]
         no_agents: bool,
         /// Suppress the interactive prompt to set up a scoped GitHub PAT
@@ -762,7 +777,7 @@ extra line in your shell rc:
 enum AgentAction {
     /// Update coding agent(s) to the latest version inside the VM.
     ///
-    /// With no agent flag, Claude Code, Codex, and Grok Build are updated.
+    /// With no agent flag, Claude Code, Codex, Grok Build, and omp are updated.
     /// The VM must be running.
     Update {
         /// Instance name (required if multiple instances exist)
@@ -784,6 +799,10 @@ enum AgentAction {
 
 /// Per-agent selection flags for `coop agent update`.
 #[derive(clap::Args, Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent CLI switches, one per agent, not mutually exclusive states"
+)]
 struct AgentFlags {
     /// Update Claude Code (default: update every agent)
     #[arg(long)]
@@ -794,6 +813,9 @@ struct AgentFlags {
     /// Update Grok Build (default: update every agent)
     #[arg(long)]
     grok: bool,
+    /// Update omp (default: update every agent)
+    #[arg(long)]
+    omp: bool,
 }
 
 impl AgentFlags {
@@ -805,6 +827,7 @@ impl AgentFlags {
                 agents::AgentKind::Claude => self.claude,
                 agents::AgentKind::Codex => self.codex,
                 agents::AgentKind::Grok => self.grok,
+                agents::AgentKind::Omp => self.omp,
             })
     }
 }
@@ -1429,6 +1452,9 @@ pub fn run() -> Result<()> {
         Commands::Grok { name, ask, args } => {
             cmd_agent_launch(&be, &cfg, agents::AgentKind::Grok, name.as_ref(), ask, args)
         }
+        Commands::Omp { name, ask, args } => {
+            cmd_agent_launch(&be, &cfg, agents::AgentKind::Omp, name.as_ref(), ask, args)
+        }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_ref())?;
             cmd_stop(&be, &cfg, &inst)
@@ -1840,6 +1866,7 @@ token = "test-pat"
             ("--claude", AgentKind::Claude),
             ("--codex", AgentKind::Codex),
             ("--grok", AgentKind::Grok),
+            ("--omp", AgentKind::Omp),
         ] {
             let cli = parse(&["agent", "update", flag]);
             let super::Commands::Agent {
@@ -2187,6 +2214,20 @@ token = "test-pat"
         };
         assert!(ask, "--ask restores permission prompts");
         assert_eq!(args, vec!["--model", "grok-4.6"]);
+    }
+
+    #[test]
+    fn omp_name_ask_and_trailing_args_parse() {
+        let cli = parse(&["omp", "myvm", "--ask", "--", "--model", "opus"]);
+        let super::Commands::Omp { name, ask, args } = cli.command else {
+            panic!("expected Omp variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
+        assert!(ask, "--ask restores approval prompts");
+        assert_eq!(args, vec!["--model", "opus"]);
     }
 
     #[test]

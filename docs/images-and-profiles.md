@@ -8,7 +8,7 @@ A template is a fully provisioned ext4 root filesystem. The build process:
 
 1. Creates an ext4 disk image (default 8 GiB, configurable with `--template-size`)
 2. Provisions a base Ubuntu system (a downloaded Firecracker CI squashfs on Firecracker, Ubuntu 24.04 cloud image on Lima)
-3. Installs base packages, Docker, GitHub CLI, Claude Code, Codex, and Grok Build
+3. Installs base packages, Docker, GitHub CLI, Claude Code, Codex, Grok Build, and omp
 4. Applies requested profiles and extra packages
 5. Runs post-install scripts if provided
 
@@ -48,9 +48,15 @@ Codex, so it costs nothing at run time.
 points there. The image also installs a `grok-yolo`
 shortcut.
 
+**omp CLI:** the latest prebuilt `omp-linux-x64` or `omp-linux-arm64` binary from
+the `can1357/oh-my-pi` GitHub release, verified against that release's
+`SHA256SUMS.txt` during the template build and installed at
+`~/.local/bin/omp` for the guest user. `/usr/local/bin/omp` points there, and
+the image also installs an `omp-yolo` shortcut. The binary is about 250 MB.
+
 The agents are installed at whatever version was current when the template was built, and that version is not part of the staleness hash — a plain `coop setup` does not refresh them. There are two ways to get newer agents:
 
-- **A live instance:** run `codex update` or `grok update` inside the VM, or `coop agent update [--claude] [--codex] [--grok]` from the host (see [`agent update`](commands.md#agent-update)). Claude Code and Grok Build also auto-update themselves in the background.
+- **A live instance:** run `codex update`, `grok update`, or `omp update` inside the VM, or `coop agent update [--claude] [--codex] [--grok] [--omp]` from the host (see [`agent update`](commands.md#agent-update)). Claude Code and Grok Build also auto-update themselves in the background.
 - **The golden image:** `coop setup --rebuild` rebuilds the template from a fresh base, so every new instance ships the latest agents.
 
 ## Built-in profiles

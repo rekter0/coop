@@ -29,7 +29,8 @@ short navigational entrypoint; durable detail lives here.
   [`shell-completion.md`](shell-completion.md).
 - [`claude-integration.md`](claude-integration.md),
   [`codex-integration.md`](codex-integration.md),
-  [`grok-integration.md`](grok-integration.md) — agent integration.
+  [`grok-integration.md`](grok-integration.md),
+  [`omp-integration.md`](omp-integration.md) — agent integration.
 - [`credential-proxy.md`](credential-proxy.md) — the opt-in `[proxy]`
   credential-injecting proxy (issue #411): keeps the raw API key out of the
   guest.

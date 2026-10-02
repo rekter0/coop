@@ -73,6 +73,10 @@ pub struct TemplateConfig {
     #[serde(default)]
     pub grok_plugins: Vec<String>,
     #[serde(default)]
+    pub omp_marketplaces: Vec<String>,
+    #[serde(default)]
+    pub omp_plugins: Vec<String>,
+    #[serde(default)]
     pub guest_user: GuestUser,
     #[serde(default)]
     pub oci_features: Vec<InstalledFeature>,
@@ -106,6 +110,7 @@ impl TemplateConfig {
             AgentKind::Claude => (&self.marketplaces, &self.plugins),
             AgentKind::Codex => (&self.codex_marketplaces, &self.codex_plugins),
             AgentKind::Grok => (&self.grok_marketplaces, &self.grok_plugins),
+            AgentKind::Omp => (&self.omp_marketplaces, &self.omp_plugins),
         }
     }
 
@@ -115,6 +120,7 @@ impl TemplateConfig {
             AgentKind::Claude => (&mut self.marketplaces, &mut self.plugins),
             AgentKind::Codex => (&mut self.codex_marketplaces, &mut self.codex_plugins),
             AgentKind::Grok => (&mut self.grok_marketplaces, &mut self.grok_plugins),
+            AgentKind::Omp => (&mut self.omp_marketplaces, &mut self.omp_plugins),
         };
         (*marketplaces, *plugins) = lists;
     }
@@ -659,6 +665,8 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         codex_plugins: Vec::new(),
         grok_marketplaces: Vec::new(),
         grok_plugins: Vec::new(),
+        omp_marketplaces: Vec::new(),
+        omp_plugins: Vec::new(),
         guest_user: opts.guest_user.clone(),
         oci_features: installed_features(&opts.oci_features),
     };
@@ -759,7 +767,7 @@ fn build_template(
         "    3. Create a {} GiB ext4 template image",
         cfg.vm.template_size_gib
     );
-    eprintln!("    4. Install Docker, Claude Code, Codex, Grok Build, and profile packages");
+    eprintln!("    4. Install Docker, Claude Code, Codex, Grok Build, omp, and profile packages");
     eprintln!("  Image: {image}");
     eprintln!("  Output: {}", cfg.template_path_for(image).display());
     eprintln!();
@@ -1506,7 +1514,7 @@ fn install_guest_packages(
     guest_user: &GuestUser,
     builder_timeout: Option<Duration>,
 ) -> Result<()> {
-    eprintln!("  Installing guest packages (Docker, Claude Code, Codex, Grok Build)...");
+    eprintln!("  Installing guest packages (Docker, Claude Code, Codex, Grok Build, omp)...");
     eprintln!("  This requires sudo and may take several minutes.");
 
     let template_str = image_path.display().to_string();
@@ -1836,6 +1844,10 @@ mod tests {
             script.contains("https://x.ai/cli/install.sh"),
             "base recipe should use the official Grok installer",
         );
+        assert!(
+            script.contains("echo '  [guest] Installing omp...'"),
+            "base recipe should install omp",
+        );
         no_consecutive_concat(&script);
     }
 
@@ -1883,6 +1895,8 @@ mod tests {
         assert!(tc.codex_plugins.is_empty());
         assert!(tc.grok_marketplaces.is_empty());
         assert!(tc.grok_plugins.is_empty());
+        assert!(tc.omp_marketplaces.is_empty());
+        assert!(tc.omp_plugins.is_empty());
     }
 
     #[test]
@@ -1907,6 +1921,7 @@ mod tests {
                 "codex_plugins",
             ),
             (AgentKind::Grok, "grok", "grok_marketplaces", "grok_plugins"),
+            (AgentKind::Omp, "omp", "omp_marketplaces", "omp_plugins"),
         ];
         for (agent, name, _, _) in agents {
             tc.set_baked(

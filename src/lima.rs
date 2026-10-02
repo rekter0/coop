@@ -1029,6 +1029,8 @@ fn build_golden_image(
         codex_plugins: Vec::new(),
         grok_marketplaces: Vec::new(),
         grok_plugins: Vec::new(),
+        omp_marketplaces: Vec::new(),
+        omp_plugins: Vec::new(),
         guest_user: guest_user.clone(),
         oci_features: installed_features(oci_features),
     };
@@ -2722,6 +2724,10 @@ mod tests {
         assert!(
             script.contains("https://x.ai/cli/install.sh"),
             "Lima provision script should use the official Grok installer",
+        );
+        assert!(
+            script.contains("echo '  [guest] Installing omp...'"),
+            "Lima provision script should install omp",
         );
     }
 

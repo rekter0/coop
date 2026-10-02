@@ -122,6 +122,12 @@ impl GuestUser {
     pub fn grok_bin(&self) -> GuestPath {
         GuestPath::new(format!("/home/{}/.grok/bin/grok", self.0))
     }
+
+    /// Where coop's omp installer places the per-user binary. Under the
+    /// guest user's home so `omp update` can replace it without sudo.
+    pub fn omp_bin(&self) -> GuestPath {
+        GuestPath::new(format!("/home/{}/.local/bin/omp", self.0))
+    }
 }
 
 /// Stable system path linking to the guest user's native Codex launcher.
@@ -242,6 +248,7 @@ pub const SCRIPT_CLAUDE_CODE: &str = include_str!("../scripts/guest/claude-code.
 pub const SCRIPT_CODEX: &str = include_str!("../scripts/guest/codex.sh");
 pub const SCRIPT_CODEX_ACCOUNT: &str = include_str!("../scripts/guest/codex-account.sh");
 pub const SCRIPT_GROK: &str = include_str!("../scripts/guest/grok.sh");
+pub const SCRIPT_OMP: &str = include_str!("../scripts/guest/omp.sh");
 
 /// Packages installed into every golden image.
 ///
@@ -637,6 +644,27 @@ mod tests {
             SCRIPT_CODEX_ACCOUNT.contains("this VM has no guest keyring yet"),
             "wrapper should explain that the first prompt chooses a password",
         );
+    }
+
+    #[test]
+    fn omp_script_installs_a_checksum_verified_release_binary() {
+        for expected in [
+            // One resolved tag for both downloads, so the binary and its
+            // checksum file come from the same release.
+            "OMP_TAG=\"${OMP_LATEST_URL##*/tag/}\"",
+            "\"$OMP_RELEASES/download/$OMP_TAG/$OMP_ASSET\"",
+            "\"$OMP_RELEASES/download/$OMP_TAG/SHA256SUMS.txt\"",
+            // The comparison itself, not just the word "sha256".
+            "if [ -z \"$OMP_EXPECTED\" ] || [ \"$OMP_EXPECTED\" != \"$OMP_ACTUAL\" ]; then",
+            "install -m 0755 -o \"$GUEST_USER\" -g \"$GUEST_USER\"",
+            "OMP_BIN=\"/home/${GUEST_USER}/.local/bin/omp\"",
+            "exec omp --yolo \"$@\"",
+        ] {
+            assert!(
+                SCRIPT_OMP.contains(expected),
+                "omp installer is missing {expected:?}",
+            );
+        }
     }
 
     #[test]

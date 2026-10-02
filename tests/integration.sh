@@ -1320,6 +1320,171 @@ CFGEOF
     fi
 }
 
+test_omp_bin_path() {
+    echo ""
+    echo "=== Phase: omp binary path ==="
+
+    local omp_bin=/home/ubuntu/.local/bin/omp
+    if guest_exec test -x "$omp_bin"; then
+        pass "omp binary exists at OMP_BIN path"
+    else
+        skip "omp binary at OMP_BIN path" "not installed in this image"
+        return
+    fi
+
+    local ver
+    if ver=$(coop_exec "$omp_bin" --version) && [[ "$ver" =~ [0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        pass "omp binary reports its version via full path ($ver)"
+    else
+        fail "omp binary reports its version via full path" \
+            "got: $ver stderr: $(guest_stderr)"
+    fi
+
+    local link_target
+    if link_target=$(guest_exec readlink /usr/local/bin/omp); then
+        if [[ "$link_target" == "$omp_bin" ]]; then
+            pass "omp symlink in /usr/local/bin"
+        else
+            fail "omp symlink in /usr/local/bin" "points to: $link_target"
+        fi
+    else
+        fail "omp symlink in /usr/local/bin" "not found"
+    fi
+
+    local yolo_content
+    if yolo_content=$(guest_exec cat /usr/local/bin/omp-yolo); then
+        if echo "$yolo_content" | grep -q -- "--yolo"; then
+            pass "omp-yolo shortcut passes --yolo"
+        else
+            fail "omp-yolo shortcut passes --yolo" "content: $yolo_content"
+        fi
+    else
+        fail "omp-yolo shortcut passes --yolo" "stderr: $(guest_stderr)"
+    fi
+
+    # `coop omp -- <subcommand>` prepends coop's approval flags; omp must
+    # ignore launch flags that precede a subcommand for that to work.
+    if coop_exec "$omp_bin" --yolo plugin list >/dev/null; then
+        pass "omp ignores --yolo before a subcommand"
+    else
+        fail "omp ignores --yolo before a subcommand" "stderr: $(guest_stderr)"
+    fi
+    if coop_exec "$omp_bin" --approval-mode always-ask plugin list >/dev/null; then
+        pass "omp ignores --approval-mode before a subcommand"
+    else
+        fail "omp ignores --approval-mode before a subcommand" "stderr: $(guest_stderr)"
+    fi
+}
+
+test_omp_config_merge() {
+    echo ""
+    echo "=== Phase: omp config copy and mcp.json merge across restart ==="
+
+    # Use a fixture host dir, not the developer's ~/.omp/agent (the suite
+    # config disables that copy). The fixture agent.db is a placeholder, so
+    # it is removed again at the end of the phase.
+    local omp_src="$tmpdir/omp-host-config"
+    mkdir -p "$omp_src/skills"
+    printf '%s\n' 'from-host' >"$omp_src/AGENTS.md"
+    printf '%s\n' 'from-host' >"$omp_src/skills/host.md"
+    printf '%s\n' 'host-db' >"$omp_src/agent.db"
+    printf '%s\n' 'redact: me' >"$omp_src/secrets.yml"
+    cat >"$omp_src/mcp.json" <<'MCPEOF'
+{"mcpServers": {"host-server": {"command": "host-cmd"}, "shared": {"command": "host"}}}
+MCPEOF
+
+    local cfg_file="$tmpdir/omp-merge-coop.toml"
+    cat >"$cfg_file" <<CFGEOF
+[grok]
+config_dir = false
+
+[omp]
+config_dir = "$omp_src"
+
+[omp.mcp_servers.coop-server]
+command = "coop-cmd"
+env = { TOKEN = "COOP_TEST_OMP_HOST" }
+CFGEOF
+
+    local seed='mkdir -p ~/.omp/agent/skills && printf "%s\n" '
+    seed+="'{\"mcpServers\": {\"guest-server\": {\"command\": \"guest-cmd\"}, \"shared\": {\"command\": \"guest\"}}}' "
+    seed+='> ~/.omp/agent/mcp.json && printf "%s\n" guest-only > ~/.omp/agent/skills/guest-only.md '
+    seed+='&& printf "%s\n" stale-wal > ~/.omp/agent/agent.db-wal'
+    if coop_exec sh -c "$seed"; then
+        pass "seed guest omp config"
+    else
+        fail "seed guest omp config" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    coop stop "$INSTANCE" || true
+    if coop --config "$cfg_file" start "$INSTANCE"; then
+        pass "restart for omp config merge exits 0"
+    else
+        fail "restart for omp config merge exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+
+    if [[ "$(coop_exec sh -c 'cat ~/.omp/agent/AGENTS.md')" == "from-host" ]]; then
+        pass "host omp AGENTS.md copied"
+    else
+        fail "host omp AGENTS.md copied" "stderr: $(guest_stderr)"
+    fi
+
+    if coop_exec sh -c 'test -f ~/.omp/agent/skills/host.md && test -f ~/.omp/agent/skills/guest-only.md'; then
+        pass "host skills copied and guest-only skills kept"
+    else
+        fail "host skills copied and guest-only skills kept" "stderr: $(guest_stderr)"
+    fi
+
+    if coop_exec sh -c 'test ! -e ~/.omp/agent/secrets.yml'; then
+        pass "omp secrets.yml stays on the host"
+    else
+        fail "omp secrets.yml stays on the host" "secrets.yml was copied"
+    fi
+
+    local db
+    if db=$(coop_exec sh -c 'cat ~/.omp/agent/agent.db && stat -c %a ~/.omp/agent/agent.db'); then
+        if [[ "$db" == $'host-db\n600' ]]; then
+            pass "omp agent.db copied as owner-only"
+        else
+            fail "omp agent.db copied as owner-only" "got: $db"
+        fi
+    else
+        fail "omp agent.db copied as owner-only" "stderr: $(guest_stderr)"
+    fi
+
+    if coop_exec sh -c 'test ! -e ~/.omp/agent/agent.db-wal'; then
+        pass "stale guest agent.db-wal removed before the copy"
+    else
+        fail "stale guest agent.db-wal removed before the copy" "agent.db-wal still present"
+    fi
+
+    local mcp
+    if ! mcp=$(coop_exec sh -c 'jq -c . ~/.omp/agent/mcp.json && stat -c %a ~/.omp/agent/mcp.json'); then
+        fail "read merged omp mcp.json" "stderr: $(guest_stderr)"
+        return
+    fi
+    if echo "$mcp" | head -1 | jq -e '
+        .mcpServers["guest-server"].command == "guest-cmd"
+        and .mcpServers.shared.command == "host"
+        and .mcpServers["host-server"].command == "host-cmd"
+        and .mcpServers["coop-server"].command == "coop-cmd"
+        and .mcpServers["coop-server"].env.TOKEN == "${COOP_TEST_OMP_HOST}"
+    ' >/dev/null; then
+        pass "omp mcp.json merges guest, host, then coop servers"
+    else
+        fail "omp mcp.json merges guest, host, then coop servers" "got: $mcp"
+    fi
+    if [[ "$(echo "$mcp" | tail -1)" == "600" ]]; then
+        pass "managed omp mcp.json is owner-only"
+    else
+        fail "managed omp mcp.json is owner-only" "got: $mcp"
+    fi
+
+    coop_exec sh -c 'rm -f ~/.omp/agent/agent.db ~/.omp/agent/mcp.json' || true
+}
+
 test_claude_settings_merge() {
     echo ""
     echo "=== Phase: claude settings merge across restart ==="
@@ -1829,10 +1994,16 @@ test_agent_update() {
     if coop agent update "$INSTANCE" --check; then
         if echo "$HARNESS_OUT" | grep -q "Claude Code" \
             && echo "$HARNESS_OUT" | grep -q "Codex" \
-            && echo "$HARNESS_OUT" | grep -q "Grok Build"; then
+            && echo "$HARNESS_OUT" | grep -q "Grok Build" \
+            && echo "$HARNESS_OUT" | grep -q "^omp "; then
             pass "agent update --check reports all agents"
         else
             fail "agent update --check reports all agents" "out: $HARNESS_OUT"
+        fi
+        if echo "$HARNESS_OUT" | grep -Eq '^omp +[0-9]+\.[0-9]+\.[0-9]+'; then
+            pass "agent update --check reads the installed omp version"
+        else
+            fail "agent update --check reads the installed omp version" "out: $HARNESS_OUT"
         fi
     else
         fail "agent update --check exits 0" "exit: $? stderr: $HARNESS_ERR"
@@ -7320,13 +7491,17 @@ main() {
 
     tmpdir=$(mktemp -d)
 
-    # Isolate the suite from the developer's ~/.grok. A real host tree can
-    # hold gigabytes of skills, venvs, and git lore; Linux CI usually has
-    # none, so the same suite would pass there and fail here. Phases that
-    # need a host copy pass their own --config with a fixture directory.
+    # Isolate the suite from the developer's ~/.grok and ~/.omp/agent. A real
+    # host tree can hold gigabytes of skills, venvs, and git lore, and omp's
+    # holds real credentials; Linux CI usually has neither, so the same suite
+    # would pass there and fail here. Phases that need a host copy pass their
+    # own --config with a fixture directory.
     SUITE_CONFIG="$tmpdir/suite-config.toml"
     cat > "$SUITE_CONFIG" <<'EOF'
 [grok]
+config_dir = false
+
+[omp]
 config_dir = false
 EOF
 
@@ -7359,6 +7534,8 @@ EOF
     test_claude_bin_path
     test_grok_bin_path
     test_grok_settings_merge
+    test_omp_bin_path
+    test_omp_config_merge
     test_claude_settings_merge
     test_claude_onboarding_seed
     test_codex_bin_path

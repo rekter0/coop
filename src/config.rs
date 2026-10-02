@@ -726,6 +726,10 @@ pub struct CoopConfig {
     #[serde(default)]
     pub grok: GrokConfig,
 
+    /// omp (oh-my-pi) config forwarding settings
+    #[serde(default)]
+    pub omp: OmpConfig,
+
     /// Host-side credential-injecting proxy (issue #411). Opt-in: when an
     /// upstream is configured, the real credential stays on the host and the
     /// guest is pointed at a local proxy instead of receiving the key.
@@ -1565,20 +1569,46 @@ pub struct GrokConfig {
     pub config_dir: ConfigDir,
 }
 
-impl GrokConfig {
-    /// Host environment variable names referenced by stdio MCP `env`
-    /// mappings. Grok expands those as `${NAME}` in the guest config, so
-    /// the names must be forwarded into the guest.
-    pub(crate) fn stdio_env_host_names(&self) -> Vec<EnvVarName> {
-        self.mcp_servers
-            .values()
-            .filter_map(|def| match def {
-                McpServerDef::Stdio { env, .. } => Some(env.values().cloned()),
-                _ => None,
-            })
-            .flatten()
-            .collect()
-    }
+/// Host environment variable names referenced by stdio MCP `env` mappings.
+/// Agents that expand those as `${NAME}` in the guest config (Grok Build,
+/// omp) need the names forwarded into the guest.
+pub(crate) fn mcp_stdio_env_host_names(servers: &HashMap<String, McpServerDef>) -> Vec<EnvVarName> {
+    servers
+        .values()
+        .filter_map(|def| match def {
+            McpServerDef::Stdio { env, .. } => Some(env.values().cloned()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct OmpConfig {
+    /// Additional env var names to forward from host to guest via SSH.
+    /// omp reads provider keys from the environment; `ANTHROPIC_API_KEY`,
+    /// `OPENAI_API_KEY`, and `XAI_API_KEY` are already forwarded.
+    #[serde(default)]
+    pub env_forward: Vec<EnvVarName>,
+
+    /// Plugin marketplace sources (URL, path, or GitHub repo)
+    #[serde(default)]
+    pub marketplaces: Vec<String>,
+
+    /// Plugins to install from marketplaces (`name@marketplace`)
+    #[serde(default)]
+    pub plugins: Vec<String>,
+
+    /// MCP servers to merge into the guest `~/.omp/agent/mcp.json`
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, McpServerDef>,
+
+    /// Source directory for omp files copied into the guest `~/.omp/agent/`
+    /// (instructions, `config.yml`, `models.yml`, the `agent.db` credential
+    /// store, and skill/rule/command/prompt/hook/tool/extension/agent
+    /// directories). Host `mcp.json` servers are merged, not copied over.
+    #[serde(default)]
+    pub config_dir: ConfigDir,
 }
 
 /// Codex cloud authentication mode.
@@ -2028,6 +2058,7 @@ impl CoopConfig {
         expand_marketplaces(&mut self.claude.marketplaces);
         expand_marketplaces(&mut self.codex.marketplaces);
         expand_marketplaces(&mut self.grok.marketplaces);
+        expand_marketplaces(&mut self.omp.marketplaces);
         for profile in self.profiles.values_mut() {
             expand_marketplaces(&mut profile.marketplaces);
         }
@@ -2133,6 +2164,15 @@ impl CoopConfig {
             ));
         }
 
+        if let ConfigDir::Custom(ref path) = self.omp.config_dir
+            && !path.is_dir()
+        {
+            errors.push(format!(
+                "omp.config_dir '{}' does not exist or is not a directory",
+                path.display()
+            ));
+        }
+
         if self.codex.auth.uses_chatgpt_account() && self.proxy.openai.is_some() {
             errors.push(
                 "codex.auth = \"chatgpt\" conflicts with [proxy.openai]; \
@@ -2149,6 +2189,7 @@ impl CoopConfig {
         );
         check_local_marketplaces("codex.marketplaces", &self.codex.marketplaces, &mut errors);
         check_local_marketplaces("grok.marketplaces", &self.grok.marketplaces, &mut errors);
+        check_local_marketplaces("omp.marketplaces", &self.omp.marketplaces, &mut errors);
 
         // `[claude.local_model]` / `[codex.local_model]` invariants
         // (http(s) scheme, present host, non-empty model) are enforced by
@@ -2469,6 +2510,7 @@ impl Default for CoopConfig {
             claude: ClaudeConfig::default(),
             codex: CodexConfig::default(),
             grok: GrokConfig::default(),
+            omp: OmpConfig::default(),
             proxy: ProxyConfig::default(),
             guest_env: BTreeMap::new(),
             profiles: HashMap::new(),

@@ -15,7 +15,7 @@ they don't introduce one.
 
 **coop's isolation boundary is the guest VM itself** — a Firecracker microVM on
 Linux, a Lima VM (Apple Virtualization.framework) on macOS. The point of the
-tool is to run AI coding agents (Claude Code, Codex, Grok Build) with broad
+tool is to run AI coding agents (Claude Code, Codex, Grok Build, omp) with broad
 autonomy *inside* that boundary, so the guest is deliberately permissive:
 
 - The guest user has passwordless `sudo` (`NOPASSWD:ALL`).
@@ -26,6 +26,8 @@ autonomy *inside* that boundary, so the guest is deliberately permissive:
   `--always-approve` and a managed `ui.permission_mode = "always-approve"`;
   `--ask` passes `--permission-mode default` so the guest config does not
   keep always-approve for that session.
+- omp is launched with `--yolo`; `--ask` passes
+  `--approval-mode always-ask`.
 
 This is intentional and correct: there is **no privilege boundary inside the
 guest to protect** — the whole VM is the blast radius. The security model is
@@ -112,7 +114,8 @@ itself authorize host execution.
 
 coop relays several secrets from the host into the guest: `ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY`, `XAI_API_KEY`, `GITHUB_TOKEN`/PAT, `CLAUDE_CODE_OAUTH_TOKEN`, arbitrary
-user `env_forward` entries, and the VM SSH key. The invariants:
+user `env_forward` entries, the host omp credential store
+(`~/.omp/agent/agent.db`), and the VM SSH key. The invariants:
 
 - **Never on argv.** Secrets ride SSH `SendEnv` (env channel) or process env
   (`backend.rs:prepare_env_forwarding`, `EnvForward`), or are piped via **stdin**
@@ -161,7 +164,10 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   its coop directories separately from `data_dir`. See
   [private host storage](configuration.md#private-host-storage). A host
   `~/.grok/auth.json` copied into the guest is `chmod 0600` after `scp`
-  (`backend.rs:restrict_guest_grok_auth`).
+  (`backend.rs:restrict_guest_grok_auth`). A host omp `agent.db` credential store
+  and its `agent.db-wal` journal are `chmod 0600` after `scp`
+  (`backend.rs:restrict_guest_omp_credentials`); an older guest journal is
+  removed first so it cannot be replayed onto the copied database.
 - **Guest environment names never configure host tools.** `EnvForward` sends
   values under generated `COOP_SSH_ENV_<index>` aliases. A guest shell captures
   all aliases, removes them, and exports the original names before executing
@@ -455,10 +461,14 @@ These are deliberate and documented in [`AGENTS.md`](../AGENTS.md) /
 understanding the rationale; do flag a change that *widens* them:
 
 - **Native agent installers are trusted build inputs.** Provisioning fetches
-  Claude's installer from `claude.ai` and Codex's from
-  `https://chatgpt.com/codex/install.sh` over HTTPS, then runs them as the
-  configured guest user. On Firecracker this happens in the host-side chroot;
-  a chroot does not provide VM isolation. Lima provisioning and live agent
+  Claude's installer from `claude.ai`, Codex's from
+  `https://chatgpt.com/codex/install.sh`, and Grok Build's from
+  `https://x.ai/cli/install.sh` over HTTPS, then runs them as the configured
+  guest user. omp is a prebuilt binary from the latest `can1357/oh-my-pi`
+  GitHub release, checked against that release's `SHA256SUMS.txt` before it
+  is installed for the guest user; that checksum proves integrity against the
+  release, not independent provenance. On Firecracker this happens in the
+  host-side chroot; a chroot does not provide VM isolation. Lima provisioning and live agent
   updates execute inside a VM. This build-time trust is distinct from the
   untrusted guest boundary described above.
 - **`DOCKER_INSECURE_NO_IPTABLES_RAW=1`** in the guest. The Firecracker CI
