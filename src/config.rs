@@ -5766,6 +5766,25 @@ skip = ["not-a-slug"]
     }
 
     #[test]
+    fn validate_rejects_nonexistent_omp_config_dir() {
+        let mut cfg = CoopConfig::default();
+        cfg.omp.config_dir = ConfigDir::Custom(ConfigPath::new("/nonexistent/config"));
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("omp.config_dir"),
+            "expected omp config_dir error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_passes_with_existing_omp_config_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = CoopConfig::default();
+        cfg.omp.config_dir = ConfigDir::Custom(ConfigPath::new(tmp.path()));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn validate_passes_with_disabled_config_dir() {
         let mut cfg = CoopConfig::default();
         cfg.claude.config_dir = ConfigDir::Disabled;
