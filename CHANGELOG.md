@@ -81,6 +81,11 @@
   `/etc/environment`. Images built with `rust` are rebuilt automatically by
   the next `coop setup` or `coop up --profile`; existing VMs keep the old
   install until recreated or `coop restore --reprovision`ed.
+- **`setlocale` warnings in guest shells** — images now install `locales` and
+  generate `en_US.UTF-8`, so a host that forwards `LANG`/`LC_ALL` with that
+  locale over SSH no longer triggers `bash: warning: setlocale: LC_ALL: cannot
+  change locale` in every guest shell. Existing images pick it up on their
+  next rebuild.
 
 ## v0.6.0
 

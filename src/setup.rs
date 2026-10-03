@@ -18,7 +18,7 @@ use crate::devcontainer_oci::installed_features;
 use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_DOCKER_REPO,
-    SCRIPT_GH_REPO, resolve_profiles,
+    SCRIPT_GH_REPO, SCRIPT_LOCALE, resolve_profiles,
 };
 use crate::sha256_hash::Sha256Hash;
 
@@ -910,7 +910,9 @@ fn compose_recipe(
          --no-install-recommends \\\n    ",
     );
     s.push_str(&BASE_PACKAGES.join(" "));
-    s.push_str(" < /dev/null\n\n");
+    s.push_str(" < /dev/null\n");
+    s.push_str(SCRIPT_LOCALE);
+    s.push('\n');
 
     // Profile pre-install (repo additions like NodeSource)
     for pre in &pre_installs {
@@ -1865,6 +1867,15 @@ mod tests {
             "base recipe should install pi",
         );
         no_consecutive_concat(&script);
+    }
+
+    #[test]
+    fn compose_recipe_generates_locale_after_base_packages() {
+        let script = compose_recipe(&[], &[], &[], &GuestUser::default());
+        let install = script.find("Installing core tools").unwrap();
+        let locale = script.find("locale-gen en_US.UTF-8").unwrap();
+        assert!(install < locale, "locale-gen needs the locales package");
+        assert!(BASE_PACKAGES.contains(&"locales"));
     }
 
     #[test]

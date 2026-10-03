@@ -18,7 +18,7 @@ coop stores the result under `~/.coop/images/<name>/`. When creating an instance
 
 Every template installs these packages regardless of profile selection.
 
-**Base packages:** `openssh-server`, `dbus-user-session`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `util-linux`, `jq`, `rsync`, `unzip`, `zip`, `file`, `gnome-keyring`, `less`, `libsecret-tools`, `nano`, `ripgrep`, `tmux`, `vim`, `htop`, `tree`, `lsof`, `fd-find` (command `fdfind`), `bat` (command `batcat`), `xxd`, `dnsutils`, `whois`, `netcat-openbsd`, `socat`, `strace`, `ltrace`, `p7zip-full`, `zstd`, `xz-utils`
+**Base packages:** `openssh-server`, `dbus-user-session`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `locales` (with `en_US.UTF-8` generated), `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `util-linux`, `jq`, `rsync`, `unzip`, `zip`, `file`, `gnome-keyring`, `less`, `libsecret-tools`, `nano`, `ripgrep`, `tmux`, `vim`, `htop`, `tree`, `lsof`, `fd-find` (command `fdfind`), `bat` (command `batcat`), `xxd`, `dnsutils`, `whois`, `netcat-openbsd`, `socat`, `strace`, `ltrace`, `p7zip-full`, `zstd`, `xz-utils`
 
 **Docker:** `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`
 

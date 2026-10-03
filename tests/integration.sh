@@ -2758,6 +2758,17 @@ test_guest_environment() {
         fi
     done
 
+    # Hosts often forward LC_ALL=en_US.UTF-8 over SSH; without the locale
+    # every guest shell prints setlocale warnings.
+    local locale_err
+    if coop_exec env LC_ALL=en_US.UTF-8 bash -c 'locale -a' | grep -qiE '^en_US\.utf-?8$' \
+        && locale_err=$(cat "$tmpdir/guest_stderr") \
+        && [[ "$locale_err" != *setlocale* ]]; then
+        pass "en_US.UTF-8 locale is available"
+    else
+        fail "en_US.UTF-8 locale is available" "stderr: $(guest_stderr)"
+    fi
+
     # Check home directory
     local home
     if home=$(guest_exec printenv HOME); then

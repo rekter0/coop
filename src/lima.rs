@@ -18,7 +18,7 @@ use crate::devcontainer_oci::{ResolvedFeature, installed_features};
 use crate::fs_util::{PrivateDir, PrivateEntryType};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_DOCKER_REPO,
-    SCRIPT_GH_REPO,
+    SCRIPT_GH_REPO, SCRIPT_LOCALE,
 };
 use crate::remote_command::RemoteCommand;
 use crate::setup::{SetupOptions, TEMPLATE_VERSION, TemplateConfig, utc_timestamp};
@@ -1811,6 +1811,7 @@ fn compose_provision_script(
     );
     s.push_str(&all_packages.join(" "));
     s.push_str(" < /dev/null\n");
+    s.push_str(SCRIPT_LOCALE);
 
     // Profile post-install scripts
     for post in &post_scripts {
@@ -2711,6 +2712,19 @@ mod tests {
                 && !script.contains(">> \"/home/ubuntu/.bashrc\""),
             "should no longer append PATH to .profile/.bashrc",
         );
+    }
+
+    #[test]
+    fn provision_script_generates_locale_after_packages() {
+        let script = compose_provision_script(
+            "ssh-ed25519 AAAA test@test",
+            &[],
+            &[],
+            &GuestUser::default(),
+        );
+        let install = script.find("Installing all packages").unwrap();
+        let locale = script.find("locale-gen en_US.UTF-8").unwrap();
+        assert!(install < locale, "locale-gen needs the locales package");
     }
 
     #[test]

@@ -251,6 +251,7 @@ pub fn verify_required_binaries(
 
 pub const SCRIPT_GH_REPO: &str = include_str!("../scripts/guest/gh-cli-repo.sh");
 pub const SCRIPT_DOCKER_REPO: &str = include_str!("../scripts/guest/docker-repo.sh");
+pub const SCRIPT_LOCALE: &str = include_str!("../scripts/guest/locale.sh");
 pub const SCRIPT_CLAUDE_CODE: &str = include_str!("../scripts/guest/claude-code.sh");
 pub const SCRIPT_CODEX: &str = include_str!("../scripts/guest/codex.sh");
 pub const SCRIPT_CODEX_ACCOUNT: &str = include_str!("../scripts/guest/codex-account.sh");
@@ -277,6 +278,7 @@ pub const BASE_PACKAGES: &[&str] = &[
     "git",
     "build-essential",
     "ca-certificates",
+    "locales",
     "gnupg",
     "lsb-release",
     "sudo",
