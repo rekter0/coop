@@ -2748,7 +2748,9 @@ test_guest_environment() {
 
     # Check basic tools
     local tool
-    for tool in git curl wget jq rsync unzip zip file less nano rg; do
+    for tool in git curl wget jq rsync unzip zip file less nano rg \
+        tmux vim htop tree lsof fdfind batcat xxd dig whois nc socat \
+        strace ltrace 7z zstd xz; do
         if guest_exec which "$tool" >/dev/null; then
             pass "$tool is installed"
         else

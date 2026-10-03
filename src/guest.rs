@@ -295,6 +295,23 @@ pub const BASE_PACKAGES: &[&str] = &[
     "libsecret-tools",
     "nano",
     "ripgrep",
+    "tmux",
+    "vim",
+    "htop",
+    "tree",
+    "lsof",
+    "fd-find",
+    "bat",
+    "xxd",
+    "dnsutils",
+    "whois",
+    "netcat-openbsd",
+    "socat",
+    "strace",
+    "ltrace",
+    "p7zip-full",
+    "zstd",
+    "xz-utils",
 ];
 
 pub const GH_PACKAGES: &[&str] = &["gh"];
