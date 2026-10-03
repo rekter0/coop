@@ -293,6 +293,8 @@ pub const BASE_PACKAGES: &[&str] = &[
     "gnome-keyring",
     "less",
     "libsecret-tools",
+    "nano",
+    "ripgrep",
 ];
 
 pub const GH_PACKAGES: &[&str] = &["gh"];

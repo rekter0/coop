@@ -57,6 +57,9 @@
   or removes from an existing instance's `lima.yaml` before restarting it.
   Guest root cannot write to it or remount it writable. `--extra-mount` and
   devcontainer mounts that overlap its guest path are rejected.
+- **`nano` and `ripgrep` in every image** — both are now base packages, so
+  `rg` and `nano` are available without a profile. Existing images pick them
+  up on their next rebuild (`coop setup` detects the change).
 
 ### Fixes
 
