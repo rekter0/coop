@@ -32,6 +32,9 @@ PROFILES="${TEST_PROFILES:-python,node}"
 INSTANCE="${TEST_INSTANCE:-test-$$}"
 FULL="${TEST_FULL:-0}"
 SUITE_CONFIG=""
+# [readonly_mount] fixture shared by every suite VM (set up in main).
+READONLY_SRC=""
+READONLY_GUEST="/coop-readonly"
 
 # Track all instances we create for cleanup
 STARTED_INSTANCES=()
@@ -284,6 +287,42 @@ CONFLICTEOF
         fi
     else
         fail "validate rejects codex.auth=chatgpt with [proxy.openai]" \
+            "validate unexpectedly succeeded"
+    fi
+
+    # [readonly_mount] needs an existing host directory, and its guest path
+    # must stay clear of /workspace.
+    cat >"$conflict_cfg" <<READONLYEOF
+[readonly_mount]
+host_path = "$conflict_dir/missing"
+guest_path = "/docs"
+READONLYEOF
+    if coop_fails --config "$conflict_cfg" validate; then
+        if grep -q "readonly_mount.host_path" <<<"$HARNESS_ERR$HARNESS_OUT"; then
+            pass "validate rejects a missing readonly_mount.host_path"
+        else
+            fail "validate rejects a missing readonly_mount.host_path" \
+                "wrong error: $HARNESS_ERR$HARNESS_OUT"
+        fi
+    else
+        fail "validate rejects a missing readonly_mount.host_path" \
+            "validate unexpectedly succeeded"
+    fi
+
+    cat >"$conflict_cfg" <<READONLYEOF
+[readonly_mount]
+host_path = "$conflict_dir"
+guest_path = "/workspace/docs"
+READONLYEOF
+    if coop_fails --config "$conflict_cfg" validate; then
+        if grep -q "readonly_mount.guest_path" <<<"$HARNESS_ERR$HARNESS_OUT"; then
+            pass "validate rejects a readonly_mount.guest_path inside /workspace"
+        else
+            fail "validate rejects a readonly_mount.guest_path inside /workspace" \
+                "wrong error: $HARNESS_ERR$HARNESS_OUT"
+        fi
+    else
+        fail "validate rejects a readonly_mount.guest_path inside /workspace" \
             "validate unexpectedly succeeded"
     fi
 
@@ -1082,6 +1121,51 @@ test_exec() {
     else
         fail "exec propagates non-zero exit code" "expected non-zero, got 0"
     fi
+}
+
+test_readonly_mount() {
+    echo ""
+    echo "=== Phase: [readonly_mount] ==="
+
+    local output
+    if output=$(coop_exec cat "$READONLY_GUEST/version.txt") && [[ "$output" == "v1" ]]; then
+        pass "readonly_mount shows the host directory"
+    else
+        fail "readonly_mount shows the host directory" \
+            "got: $output; stderr: $(guest_stderr)"
+    fi
+
+    if output=$(coop_exec cat "$READONLY_GUEST/nested/file.txt") && [[ "$output" == "nested" ]]; then
+        pass "readonly_mount includes subdirectories"
+    else
+        fail "readonly_mount includes subdirectories" \
+            "got: $output; stderr: $(guest_stderr)"
+    fi
+
+    # The read-only guarantee is enforced outside the guest, so even guest
+    # root can neither write nor remount the share writable.
+    if coop_exec sudo touch "$READONLY_GUEST/guest-write"; then
+        fail "guest root cannot write the readonly_mount" "touch succeeded"
+    else
+        pass "guest root cannot write the readonly_mount"
+    fi
+
+    if coop_exec sudo sh -c 'mount -o remount,rw "$1" && touch "$1/guest-write"' \
+        sh "$READONLY_GUEST"; then
+        fail "guest root cannot remount the readonly_mount writable" "write succeeded"
+    else
+        pass "guest root cannot remount the readonly_mount writable"
+    fi
+
+    if [[ ! -e "$READONLY_SRC/guest-write" ]]; then
+        pass "readonly_mount leaves the host directory untouched"
+    else
+        fail "readonly_mount leaves the host directory untouched" \
+            "$READONLY_SRC/guest-write exists"
+    fi
+
+    # test_restart_stopped checks that the next boot shows this edit.
+    printf 'v2\n' >"$READONLY_SRC/version.txt"
 }
 
 test_claude_bin_path() {
@@ -3513,6 +3597,16 @@ test_restart_stopped() {
         pass "workspace persists across restart"
     else
         fail "workspace persists across restart" "exit code: $?"
+    fi
+
+    # test_readonly_mount edited the host copy while the VM ran; a boot
+    # always shows the directory as it is then.
+    local output
+    if output=$(coop_exec cat "$READONLY_GUEST/version.txt") && [[ "$output" == "v2" ]]; then
+        pass "readonly_mount shows host edits after restart"
+    else
+        fail "readonly_mount shows host edits after restart" \
+            "got: $output; stderr: $(guest_stderr)"
     fi
 
     # Verify duplicate start of running instance is rejected
@@ -7675,6 +7769,20 @@ config_dir = false
 config_dir = false
 EOF
 
+    # Every suite VM mounts this fixture read-only; test_readonly_mount checks
+    # it, then edits the host copy for test_restart_stopped to see.
+    READONLY_SRC="$tmpdir/readonly-src"
+    mkdir -p "$READONLY_SRC/nested"
+    printf 'v1\n' >"$READONLY_SRC/version.txt"
+    printf 'nested\n' >"$READONLY_SRC/nested/file.txt"
+    chmod -R a+rX "$READONLY_SRC"
+    cat >>"$SUITE_CONFIG" <<EOF
+
+[readonly_mount]
+host_path = "$READONLY_SRC"
+guest_path = "$READONLY_GUEST"
+EOF
+
     verify_binary
 
     # Pre-VM tests
@@ -7701,6 +7809,7 @@ EOF
     test_ssh_config
     test_editor
     test_exec
+    test_readonly_mount
     test_claude_bin_path
     test_grok_bin_path
     test_grok_settings_merge

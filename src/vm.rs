@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Write as _};
 use std::marker::PhantomData;
 use std::net::TcpStream;
 use std::num::NonZeroU8;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::backend::LogMode;
 use crate::cmd::Cmd;
 use crate::config::{CoopConfig, Instance, MiB};
+use crate::paths::GuestPath;
+use crate::remote_command::RemoteCommand;
 
 // ── Typestate markers ─────────────────────────────────────────
 
@@ -84,17 +86,26 @@ struct VsockConfig {
 }
 
 fn build_config(cfg: &CoopConfig, inst: &Instance) -> FirecrackerConfig {
+    let mut drives = vec![Drive {
+        id: "rootfs".to_string(),
+        path_on_host: inst.rootfs_path().display().to_string(),
+        is_root_device: true,
+        is_read_only: false,
+    }];
+    if cfg.readonly_mount.is_some() {
+        drives.push(Drive {
+            id: READONLY_MOUNT_DRIVE_ID.to_string(),
+            path_on_host: inst.readonly_mount_image_path().display().to_string(),
+            is_root_device: false,
+            is_read_only: true,
+        });
+    }
     FirecrackerConfig {
         boot_source: BootSource {
             kernel_image_path: cfg.vm.kernel_path.display().to_string(),
             boot_args: cfg.vm.boot_args.clone(),
         },
-        drives: vec![Drive {
-            id: "rootfs".to_string(),
-            path_on_host: inst.rootfs_path().display().to_string(),
-            is_root_device: true,
-            is_read_only: false,
-        }],
+        drives,
         machine_config: MachineConfig {
             vcpu_count: cfg.vm.vcpu_count.get(),
             mem_size_mib: cfg.vm.mem_size_mib.get().as_u32(),
@@ -109,6 +120,157 @@ fn build_config(cfg: &CoopConfig, inst: &Instance) -> FirecrackerConfig {
             uds_path: inst.vsock_path().display().to_string(),
         }),
     }
+}
+
+// ── Read-only mount image ─────────────────────────────────────
+
+/// Firecracker drive ID of the `[readonly_mount]` image.
+const READONLY_MOUNT_DRIVE_ID: &str = "readonly_mount";
+/// ext4 label the guest finds the `[readonly_mount]` drive by.
+const READONLY_MOUNT_LABEL: &str = "coop-readonly";
+const MKFS_EXT4: &str = "/usr/sbin/mkfs.ext4";
+const BLOCK_SIZE: u64 = 4096;
+const INODE_SIZE: u64 = 256;
+/// Inodes beyond the tree's own entries: `lost+found` and spare room.
+const INODE_SLACK: u64 = 64;
+const MIB: u64 = 1024 * 1024;
+
+/// What sizing the `[readonly_mount]` image needs to know about its source.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TreeStats {
+    /// File, directory, and symlink bytes, each rounded up to whole blocks.
+    block_bytes: u64,
+    /// Every entry, the root included.
+    inodes: u64,
+    /// Entries below the root that "other" cannot read (or, for directories,
+    /// search). The guest user reads them only if its uid happens to own
+    /// them. The root is exempt: `mkfs.ext4` makes it `0755 root`.
+    unreadable: Vec<PathBuf>,
+}
+
+/// Walk `root` without following symlinks, the way `mkfs.ext4 -d` copies it.
+fn scan_tree(root: &Path) -> Result<TreeStats> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut stats = TreeStats::default();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let meta = fs::symlink_metadata(&path)
+            .with_context(|| format!("Failed to stat {}", path.display()))?;
+        let mode = meta.permissions().mode();
+        stats.inodes += 1;
+        if meta.is_dir() {
+            let mut entry_bytes = 0;
+            for entry in
+                fs::read_dir(&path).with_context(|| format!("Failed to read {}", path.display()))?
+            {
+                let entry = entry.with_context(|| format!("Failed to read {}", path.display()))?;
+                // An ext4 directory entry is an 8-byte header plus the name,
+                // padded to 4 bytes.
+                entry_bytes += (8 + entry.file_name().len() as u64).next_multiple_of(4);
+                pending.push(entry.path());
+            }
+            stats.block_bytes += entry_bytes.max(1).next_multiple_of(BLOCK_SIZE);
+            if mode & 0o005 != 0o005 && path != root {
+                stats.unreadable.push(path);
+            }
+        } else if meta.is_file() {
+            stats.block_bytes += meta.len().next_multiple_of(BLOCK_SIZE);
+            if mode & 0o004 == 0 {
+                stats.unreadable.push(path);
+            }
+        } else if meta.is_symlink() {
+            stats.block_bytes += BLOCK_SIZE;
+        }
+    }
+    Ok(stats)
+}
+
+/// Image size for a scanned tree: its blocks and inode table plus half
+/// again, and 32 MiB for ext4's own metadata, in whole MiB. The image is a
+/// sparse file, so the headroom costs no host disk.
+fn readonly_image_size(stats: &TreeStats) -> u64 {
+    let used = stats.block_bytes + (stats.inodes + INODE_SLACK) * INODE_SIZE;
+    (used + used / 2 + 32 * MIB).next_multiple_of(MIB)
+}
+
+/// Rebuild the instance's `[readonly_mount]` image from the host directory,
+/// or remove a leftover one when the config no longer asks for it.
+///
+/// Runs before every boot, so the guest sees the directory as it is at that
+/// moment. The image is written beside its final path and renamed into
+/// place, so an interrupted build never leaves a partial image where
+/// Firecracker looks.
+pub fn prepare_readonly_mount_image(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+    let image = inst.readonly_mount_image_path();
+    let Some(mount) = &cfg.readonly_mount else {
+        return match fs::remove_file(&image) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("Failed to remove {}", image.display()))
+            }
+            _ => Ok(()),
+        };
+    };
+
+    let stats = scan_tree(&mount.host_path)?;
+    if let Some(first) = stats.unreadable.first() {
+        tracing::warn!(
+            "{} entries in {} are not world-readable (e.g. {:?}); the guest user can read \
+             them only if its uid owns them. `chmod -R o+rX` the directory to fix this.",
+            stats.unreadable.len(),
+            mount.host_path.display(),
+            first,
+        );
+    }
+
+    tracing::info!(
+        "Building read-only mount image from {}",
+        mount.host_path.display()
+    );
+    let staging = tempfile::Builder::new()
+        .prefix(".readonly-mount-")
+        .suffix(".ext4")
+        .tempfile_in(&inst.dir)
+        .with_context(|| format!("Failed to create a staging image in {}", inst.dir.display()))?;
+    staging
+        .as_file()
+        .set_len(readonly_image_size(&stats))
+        .context("Failed to size the read-only mount image")?;
+    Cmd::new(MKFS_EXT4)
+        .args(["-q", "-F", "-L", READONLY_MOUNT_LABEL, "-m", "0"])
+        .args(["-O", "^has_journal,^resize_inode", "-E", "nodiscard"])
+        .arg("-N")
+        .arg((stats.inodes + INODE_SLACK).to_string())
+        .arg("-d")
+        .arg(&*mount.host_path)
+        .arg(staging.path())
+        .run()
+        .with_context(|| {
+            format!(
+                "Failed to build the read-only mount image from {}",
+                mount.host_path.display()
+            )
+        })?;
+    staging
+        .persist(&image)
+        .with_context(|| format!("Failed to install {}", image.display()))?;
+    Ok(())
+}
+
+/// Guest command that mounts the `[readonly_mount]` drive, found by its
+/// ext4 label, read-only at `guest_path`. A path that is already a mount
+/// point is left alone, so rerunning it is harmless.
+pub fn readonly_mount_command(guest_path: &GuestPath) -> RemoteCommand {
+    RemoteCommand::new()
+        .literal("sudo mkdir -p ")
+        .arg(guest_path)
+        .literal(" && { mountpoint -q ")
+        .arg(guest_path)
+        .literal(" || sudo mount -t ext4 -o ro,nosuid,nodev -L ")
+        .arg(READONLY_MOUNT_LABEL)
+        .literal(" ")
+        .arg(guest_path)
+        .literal("; }")
 }
 
 /// Read the persisted machine config (mem/vcpu) from an instance's JSON.
@@ -637,10 +799,124 @@ fn wait_for_exit(pid: u32, timeout: Duration) -> Result<bool> {
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
     use super::{
-        Duration, FirecrackerVm, Instant, MachineConfig, MiB, NonZeroU8, apply_machine_resources,
-        read_machine_config, wait_for_exit, wait_for_pid_file,
+        BLOCK_SIZE, Duration, FirecrackerVm, INODE_SIZE, INODE_SLACK, Instant, MIB, MachineConfig,
+        MiB, NonZeroU8, TreeStats, apply_machine_resources, build_config,
+        prepare_readonly_mount_image, read_machine_config, readonly_image_size,
+        readonly_mount_command, scan_tree, wait_for_exit, wait_for_pid_file,
     };
-    use crate::config::{CoopConfig, ImageName, Instance, InstanceIndex, InstanceName};
+    use crate::config::{
+        ConfigPath, CoopConfig, ImageName, Instance, InstanceIndex, InstanceName, ReadonlyMount,
+    };
+    use crate::paths::GuestPath;
+
+    fn test_instance(dir: &std::path::Path) -> Instance {
+        Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: dir.to_path_buf(),
+            image: ImageName::new("default").unwrap(),
+        }
+    }
+
+    #[test]
+    fn build_config_attaches_readonly_drive_only_when_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = test_instance(tmp.path());
+        let mut cfg = CoopConfig::default();
+        assert_eq!(build_config(&cfg, &inst).drives.len(), 1);
+
+        cfg.readonly_mount = Some(ReadonlyMount {
+            host_path: ConfigPath::new("/srv/docs"),
+            guest_path: GuestPath::new("/docs"),
+        });
+        let drives = build_config(&cfg, &inst).drives;
+        assert_eq!(drives.len(), 2);
+        assert!(drives[0].is_root_device && !drives[0].is_read_only);
+        assert_eq!(drives[1].id, "readonly_mount");
+        assert_eq!(
+            drives[1].path_on_host,
+            inst.readonly_mount_image_path().display().to_string()
+        );
+        assert!(drives[1].is_read_only);
+        assert!(!drives[1].is_root_device);
+    }
+
+    #[test]
+    fn scan_tree_counts_blocks_inodes_and_unreadable_entries() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("docs");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let readable = root.join("a.md");
+        std::fs::write(&readable, vec![b'x'; 5000]).unwrap();
+        std::fs::set_permissions(&readable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let private = root.join("b.md");
+        std::fs::write(&private, "").unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.join("link")).unwrap();
+
+        let stats = scan_tree(&root).unwrap();
+        assert_eq!(stats.inodes, 4);
+        // Root directory block + two blocks for 5000 bytes + one symlink
+        // block; the empty file takes none.
+        assert_eq!(stats.block_bytes, 4 * BLOCK_SIZE);
+        assert_eq!(stats.unreadable, vec![private]);
+    }
+
+    #[test]
+    fn scan_tree_flags_unsearchable_directories_below_the_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("docs");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // The image root is always 0755, so a private source root is fine.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o754)).unwrap();
+        assert_eq!(scan_tree(&root).unwrap().unreadable, vec![sub]);
+    }
+
+    #[test]
+    fn readonly_image_size_adds_headroom_in_whole_mib() {
+        let empty_used = INODE_SLACK * INODE_SIZE;
+        assert_eq!(
+            readonly_image_size(&TreeStats::default()),
+            (empty_used + empty_used / 2 + 32 * MIB).next_multiple_of(MIB)
+        );
+
+        let stats = TreeStats {
+            block_bytes: 100 * MIB,
+            inodes: 1000,
+            unreadable: Vec::new(),
+        };
+        let used = 100 * MIB + (1000 + INODE_SLACK) * INODE_SIZE;
+        assert_eq!(
+            readonly_image_size(&stats),
+            (used + used / 2 + 32 * MIB).next_multiple_of(MIB)
+        );
+    }
+
+    #[test]
+    fn readonly_mount_command_quotes_the_guest_path() {
+        let cmd = readonly_mount_command(&GuestPath::new("/opt/ref docs")).into_string();
+        assert_eq!(
+            cmd,
+            "sudo mkdir -p '/opt/ref docs' && { mountpoint -q '/opt/ref docs' || \
+             sudo mount -t ext4 -o ro,nosuid,nodev -L 'coop-readonly' '/opt/ref docs'; }"
+        );
+    }
+
+    #[test]
+    fn prepare_readonly_mount_image_removes_image_when_unconfigured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = test_instance(tmp.path());
+        let cfg = CoopConfig::default();
+        prepare_readonly_mount_image(&cfg, &inst).unwrap();
+        std::fs::write(inst.readonly_mount_image_path(), "stale").unwrap();
+        prepare_readonly_mount_image(&cfg, &inst).unwrap();
+        assert!(!inst.readonly_mount_image_path().exists());
+    }
 
     #[test]
     fn configure_creates_and_replaces_private_config_under_permissive_umask() {

@@ -4,7 +4,7 @@ coop reads configuration from `~/.coop/config.toml` by default. Pass `--config <
 
 If the file does not exist, coop falls back to built-in defaults. A valid minimal config is an empty file.
 
-A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, `grok.config_dir`, `omp.config_dir`, `pi.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `grok.marketplaces` / `omp.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
+A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, `grok.config_dir`, `omp.config_dir`, `pi.config_dir`, `readonly_mount.host_path`, and the `claude.marketplaces` / `codex.marketplaces` / `grok.marketplaces` / `omp.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
 
 Run `coop validate` to surface errors and warnings before anything touches a VM.
 
@@ -509,6 +509,49 @@ label = "postgres"
 `--forward-port` on `coop up` or `coop start` appends to (or overrides on guest-port collision) the entries from config; later entries win. Each instance remembers its forward set across `coop stop` / `coop start`, so a restart without `--forward-port` re-establishes the same tunnels.
 
 Collision with an in-use host port fails fast before the VM is created. The error names the offending port and suggests a `GUEST:HOST` override.
+
+## `readonly_mount` section
+
+A host directory that every VM sees read-only. Use it for reference material
+the agents should read but never change, such as documentation. Edit the
+directory on the host.
+
+```toml
+[readonly_mount]
+host_path = "~/coop-docs"
+guest_path = "/docs"
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `host_path` | string (path) | Directory on the host. Must be absolute (or start with `~`) and exist. `coop validate` and every boot check this. |
+| `guest_path` | string | Where it appears in the guest. Must be absolute and normalized, must not be `/`, and must not be `/workspace` or inside it. |
+
+The mount applies to every VM, including ones created before you added it:
+each boot uses the current config, and removing the section removes the
+mount at the next start. An `--extra-mount` or devcontainer mount whose guest
+path overlaps `guest_path` is rejected.
+
+The guest cannot write to it, even as root. Firecracker's read-only drive and
+macOS's read-only share both refuse writes outside the guest, so
+`mount -o remount,rw` inside the VM does not lift it.
+
+| Backend | What the guest sees | When host edits show up |
+|---------|---------------------|-------------------------|
+| Linux / Firecracker | A read-only ext4 drive that coop rebuilds from `host_path` before each boot | At the next `coop start` (or `coop stop` + `coop start`) |
+| macOS / Lima | A virtiofs mount with `writable: false` | Immediately |
+
+On Firecracker, each instance keeps its own copy of the image
+(`readonly-mount.ext4` in the instance directory). It is a sparse file, so it
+takes roughly the size of the directory on disk. It holds an ext4
+`lost+found` directory that is not in `host_path`. Files keep their host owner
+and mode, so the guest user can read a file only if it is world-readable or
+owned by the guest user's uid. coop warns at boot about entries that are not
+world-readable; `chmod -R o+rX` the directory to fix them. Symlinks are copied
+as links, not followed.
+
+Every VM reads the same content, so do not put credentials or other secrets
+in this directory.
 
 ## `updates` section
 

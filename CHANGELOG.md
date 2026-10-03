@@ -49,6 +49,14 @@
   `pi update`, and `--check` compares pi against its latest GitHub release.
   Existing images need `coop setup --rebuild`; existing VMs also need
   `coop restore <vm> --image <image> --reprovision` (or destroy/recreate).
+- **`[readonly_mount]`** — a config section that shows one host directory,
+  read-only, to every VM at `guest_path`, existing VMs included from their next
+  start. On Linux/Firecracker coop rebuilds a read-only ext4 drive from the
+  directory before each boot and mounts it by label; on macOS/Lima it is a
+  live virtiofs mount with `writable: false`, which coop adds to, updates in,
+  or removes from an existing instance's `lima.yaml` before restarting it.
+  Guest root cannot write to it or remount it writable. `--extra-mount` and
+  devcontainer mounts that overlap its guest path are rejected.
 
 ## v0.6.0
 

@@ -958,11 +958,46 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         bail!("Instance '{}' is already running", inst.name);
     }
     boot_preflight(cfg)?;
+    boot_firecracker(cfg, inst)
+}
+
+/// Boot an instance whose rootfs exists: rebuild its `[readonly_mount]`
+/// image, write the Firecracker config, start the VMM, wait for the guest,
+/// and mount the read-only drive. Every Firecracker boot goes through here.
+#[cfg(not(target_os = "macos"))]
+fn boot_firecracker(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+    crate::vm::prepare_readonly_mount_image(cfg, inst)?;
     let vm = crate::vm::FirecrackerVm::new(cfg, inst);
     vm.configure()?;
     crate::network::setup_tap(&cfg.network, inst)?;
     let running = vm.start()?;
-    running.wait_for_boot()
+    running.wait_for_boot()?;
+    mount_readonly_drive(cfg, inst)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mount_readonly_drive(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+    let Some(mount) = &cfg.readonly_mount else {
+        return Ok(());
+    };
+    let target = FirecrackerBackend.ssh_target(cfg, inst)?;
+    target
+        .wait_until_ready(Duration::from_secs(30))
+        .context("Guest booted but SSH is not accepting connections")?;
+    target
+        .exec(crate::vm::readonly_mount_command(&mount.guest_path))
+        .with_context(|| {
+            format!(
+                "Failed to mount [readonly_mount] at {} in '{}'",
+                mount.guest_path, inst.name
+            )
+        })?;
+    tracing::info!(
+        "Mounted {} read-only at {}",
+        mount.host_path.display(),
+        mount.guest_path
+    );
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -988,11 +1023,7 @@ impl VmBackend for FirecrackerBackend {
         // Validation already happened in Mount::parse().
         let _ = mounts;
         crate::setup::create_instance(cfg, inst, disk_gib)?;
-        let vm = crate::vm::FirecrackerVm::new(cfg, inst);
-        vm.configure()?;
-        crate::network::setup_tap(&cfg.network, inst)?;
-        let running = vm.start()?;
-        running.wait_for_boot()
+        boot_firecracker(cfg, inst)
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {

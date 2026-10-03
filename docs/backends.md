@@ -39,6 +39,7 @@ The Lima template configures:
 - `vmType: "vz"` (Virtualization.framework, not QEMU)
 - Rosetta enabled for x86_64 binary translation on Apple Silicon
 - `mountType: "virtiofs"` with no host mounts (empty `mounts: []`). When `coop up --mount` is used, Lima adds virtiofs mount entries for the specified host directories, providing live mounts where changes are visible immediately on both sides. Host and guest paths are serialized as YAML scalars so special characters remain part of the path.
+- A configured `[readonly_mount]` becomes one more virtiofs entry with `writable: false`, which Virtualization.framework shares read-only. coop writes every other mount `writable: true`, so before restarting a stopped instance it compares the instance's `writable: false` entries (from `limactl list --json`) with the config. If they differ, it runs `limactl edit --set` to replace them, so config changes reach existing instances.
 - Lima's built-in containerd disabled (Docker is installed in the guest instead)
 
 ### Resize (disk, memory, vCPUs)
@@ -84,6 +85,12 @@ Creating an instance (`coop up`) follows this sequence:
 6. Starts the Firecracker process with `sudo`. Firecracker requires root for KVM and TAP access.
 7. Records the Firecracker PID and waits for SSH to become reachable.
 8. If `--mount` was specified, rsyncs the host directory into the guest. This is a one-time copy, not a live mount. Use `coop push` and `coop pull` to re-sync.
+
+If `[readonly_mount]` is configured, every boot (create, `start`, `resize --start`) also:
+
+1. Builds `readonly-mount.ext4` in the instance directory from `host_path` with `mkfs.ext4 -d`. The image is sparse, has no journal, carries the label `coop-readonly`, and is renamed into place only once complete. When the config no longer has the section, a leftover image is deleted instead.
+2. Attaches it as a second Firecracker drive with `is_read_only: true`, so the virtio-blk device itself refuses writes.
+3. Once SSH is up, mounts it in the guest with `mount -t ext4 -o ro,nosuid,nodev -L coop-readonly` at `guest_path`.
 
 The code uses a typestate pattern (`Configured` then `Running`) to enforce valid lifecycle transitions at compile time.
 
@@ -163,4 +170,5 @@ Both backends support the same CLI commands and guest capabilities:
 | Resource monitoring | SSH query to guest | SSH query to guest |
 | Docker in guest | Works (full kernel) | Works (with iptables-legacy workaround) |
 | `--mount` host mounts | Live virtiofs (changes visible immediately) | One-time rsync sync (use `push`/`pull` to re-sync) |
+| `[readonly_mount]` | Live read-only virtiofs | Read-only drive rebuilt from the host directory at each boot |
 | Needs sudo | No | Yes (VM start, stop, networking, rootfs ops) |

@@ -43,6 +43,20 @@ impl GuestPath {
         }
         Ok(Self(path))
     }
+
+    /// True if one path is the other or contains it, compared by whole
+    /// components: `/data` overlaps `/data/x` but not `/database`. Trailing
+    /// slashes are ignored, so `/` overlaps every absolute path.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        let a = self.0.trim_end_matches('/');
+        let b = other.0.trim_end_matches('/');
+        a == b || is_beneath(a, b) || is_beneath(b, a)
+    }
+}
+
+fn is_beneath(path: &str, ancestor: &str) -> bool {
+    path.strip_prefix(ancestor)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 impl std::fmt::Display for GuestPath {
@@ -122,6 +136,20 @@ mod tests {
         // expansion gotcha, see docs/platform-notes.md).
         let p = GuestPath::new("./.claude");
         assert_eq!(p.to_string(), "./.claude");
+    }
+
+    #[test]
+    fn overlaps_compares_whole_components() {
+        let path = |p: &str| GuestPath::new(p);
+        assert!(path("/data").overlaps(&path("/data")));
+        assert!(path("/data").overlaps(&path("/data/")));
+        assert!(path("/data").overlaps(&path("/data/docs")));
+        assert!(path("/data/docs").overlaps(&path("/data")));
+        assert!(path("/").overlaps(&path("/docs")));
+        assert!(path("/docs").overlaps(&path("/")));
+        assert!(!path("/data").overlaps(&path("/database")));
+        assert!(!path("/database").overlaps(&path("/data")));
+        assert!(!path("/a/b").overlaps(&path("/a/c")));
     }
 
     #[test]

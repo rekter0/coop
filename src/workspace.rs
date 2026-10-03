@@ -8,7 +8,7 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{RunningInstance, SshTarget};
-use crate::config::{Instance, Mount};
+use crate::config::{Instance, Mount, ReadonlyMount};
 use crate::paths::GuestPath;
 use crate::remote_command::RemoteCommand;
 
@@ -394,8 +394,9 @@ pub(crate) enum WorkspaceMountRule {
 }
 
 /// A start-time mount set that has passed collection-level validation: no
-/// two mounts target the same guest path, and — per [`WorkspaceMountRule`]
-/// — no extra mount collides with the project's `/workspace`.
+/// two mounts target the same guest path, none overlaps the
+/// `[readonly_mount]` guest path, and — per [`WorkspaceMountRule`] — no
+/// extra mount collides with the project's `/workspace`.
 ///
 /// [`Self::assemble`] is the single place these invariants are enforced, so
 /// no lifecycle path (`up --copy`, `up --mount`, `up --git-repo`,
@@ -406,8 +407,13 @@ pub(crate) struct ValidatedMounts(Vec<Mount>);
 impl ValidatedMounts {
     /// Validate an assembled mount set under `rule`. `mounts` is the final
     /// set (project mount already inserted for `--mount`, extra mounts
-    /// appended), so the checks see exactly what boot will use.
-    pub(crate) fn assemble(rule: WorkspaceMountRule, mounts: Vec<Mount>) -> Result<Self> {
+    /// appended), so the checks see exactly what boot will use. `readonly`
+    /// is the configured `[readonly_mount]`, which every boot adds.
+    pub(crate) fn assemble(
+        rule: WorkspaceMountRule,
+        mounts: Vec<Mount>,
+        readonly: Option<&ReadonlyMount>,
+    ) -> Result<Self> {
         let collision_message = match rule {
             WorkspaceMountRule::CopyProject => Some(
                 "`coop up --copy` already uses /workspace for the project. \
@@ -428,6 +434,18 @@ impl ValidatedMounts {
             {
                 bail!("{message}");
             }
+        }
+        if let Some(readonly) = readonly
+            && let Some(mount) = mounts
+                .iter()
+                .find(|mount| mount.guest_path.overlaps(&readonly.guest_path))
+        {
+            bail!(
+                "Mount guest path {} overlaps the [readonly_mount] guest path {}. \
+                 Choose a guest path outside it.",
+                mount.guest_path,
+                readonly.guest_path,
+            );
         }
         crate::config::validate_unique_guest_paths(&mounts)?;
         Ok(Self(mounts))
@@ -1644,7 +1662,7 @@ mod tests {
         std::fs::create_dir(&data).expect("data");
         let mounts = vec![Mount::parse(data.to_str().unwrap()).expect("mount")];
 
-        let err = ValidatedMounts::assemble(WorkspaceMountRule::GitRepoClone, mounts)
+        let err = ValidatedMounts::assemble(WorkspaceMountRule::GitRepoClone, mounts, None)
             .expect_err("expected /workspace collision");
         assert!(format!("{err}").contains("/workspace"));
     }
@@ -1657,9 +1675,12 @@ mod tests {
         // A project legitimately mounted at /workspace (coop up --mount) is
         // fine; the ProjectMountedOrNone rule skips the collision check.
         let mounts = vec![Mount::parse(data.to_str().unwrap()).expect("mount")];
-        let validated =
-            ValidatedMounts::assemble(WorkspaceMountRule::ProjectMountedOrNone, mounts.clone())
-                .expect("workspace mount allowed under ProjectMountedOrNone");
+        let validated = ValidatedMounts::assemble(
+            WorkspaceMountRule::ProjectMountedOrNone,
+            mounts.clone(),
+            None,
+        )
+        .expect("workspace mount allowed under ProjectMountedOrNone");
         assert_eq!(validated.into_vec().len(), 1);
     }
 
@@ -1684,9 +1705,30 @@ mod tests {
             WorkspaceMountRule::GitRepoClone,
             WorkspaceMountRule::ProjectMountedOrNone,
         ] {
-            let err = ValidatedMounts::assemble(rule, dup()).expect_err("duplicate guest path");
+            let err =
+                ValidatedMounts::assemble(rule, dup(), None).expect_err("duplicate guest path");
             assert!(format!("{err}").contains("Duplicate mount guest path"));
         }
+    }
+
+    #[test]
+    fn assemble_rejects_mounts_overlapping_the_readonly_mount() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let readonly = ReadonlyMount {
+            host_path: crate::config::ConfigPath::new(tmp.path()),
+            guest_path: GuestPath::new("/docs"),
+        };
+        let host = tmp.path().to_str().unwrap();
+        for guest in ["/docs", "/docs/extra", "/"] {
+            let mounts = vec![Mount::parse(&format!("{host}:{guest}")).expect("mount")];
+            let err =
+                ValidatedMounts::assemble(WorkspaceMountRule::CopyProject, mounts, Some(&readonly))
+                    .expect_err("overlapping guest path");
+            assert!(format!("{err}").contains("[readonly_mount]"), "{err}");
+        }
+        let mounts = vec![Mount::parse(&format!("{host}:/docs2")).expect("mount")];
+        ValidatedMounts::assemble(WorkspaceMountRule::CopyProject, mounts, Some(&readonly))
+            .expect("sibling guest path is allowed");
     }
 
     /// Run `f` with a thread-local WARN-level subscriber and return its

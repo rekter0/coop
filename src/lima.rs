@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::agents::AgentKind;
 use crate::backend::{Hostname, LogMode, SshTarget, SshUser};
-use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName, MiB};
+use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName, MiB, ReadonlyMount};
 use crate::devcontainer_oci::{ResolvedFeature, installed_features};
 use crate::fs_util::{PrivateDir, PrivateEntryType};
 use crate::guest::{
@@ -103,7 +103,13 @@ pub fn create_and_start(
     let mut template_file =
         image_dir.open_regular(template_path.file_name().context("Template has no name")?)?;
 
-    let effective_template = instance_template(inst, mounts, &mut template_file, &template_path)?;
+    let effective_template = instance_template(
+        inst,
+        mounts,
+        cfg.readonly_mount.as_ref(),
+        &mut template_file,
+        &template_path,
+    )?;
 
     // Clean up leftover Lima instance from a previous failed start
     if let Some(state) = lima_state(&inst.name)? {
@@ -179,14 +185,16 @@ pub fn create_and_start(
     Ok(())
 }
 
-/// Generate a private per-instance Lima template when mounts are requested.
+/// Generate a private per-instance Lima template when mounts or a
+/// `[readonly_mount]` are requested.
 fn instance_template(
     inst: &Instance,
     mounts: &[crate::config::Mount],
+    readonly: Option<&ReadonlyMount>,
     template_file: &mut File,
     template_path: &Path,
 ) -> Result<PathBuf> {
-    if mounts.is_empty() {
+    if mounts.is_empty() && readonly.is_none() {
         return Ok(template_path.to_path_buf());
     }
     let inst_template = inst.dir.join("lima-template.yaml");
@@ -194,7 +202,7 @@ fn instance_template(
     template_file
         .read_to_string(&mut base_yaml)
         .with_context(|| format!("Failed to read {}", template_path.display()))?;
-    let yaml = inject_mounts(&base_yaml, mounts)?;
+    let yaml = inject_mounts(&base_yaml, mounts, readonly)?;
     let instance_dir = PrivateDir::create(&inst.dir)?;
     instance_dir
         .write_atomic_private(OsStr::new("lima-template.yaml"), yaml.as_bytes(), 0o600)
@@ -202,6 +210,13 @@ fn instance_template(
     for mount in mounts {
         tracing::info!(
             "Mount: {} -> {}",
+            mount.host_path.display(),
+            mount.guest_path
+        );
+    }
+    if let Some(mount) = readonly {
+        tracing::info!(
+            "Read-only mount: {} -> {}",
             mount.host_path.display(),
             mount.guest_path
         );
@@ -218,6 +233,8 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         Some(state) => bail!("Lima instance '{name}' is {state}, not stopped"),
         None => bail!("Lima instance '{name}' is absent"),
     }
+
+    sync_readonly_mount(cfg, inst)?;
 
     tracing::info!("Restarting stopped Lima instance '{name}'");
 
@@ -1569,9 +1586,14 @@ containerd:
     Ok(())
 }
 
-/// Replace `mounts: []` in a Lima YAML template with writable virtiofs
-/// mount entries. Returns the modified YAML string.
-fn inject_mounts(yaml: &str, mounts: &[crate::config::Mount]) -> Result<String> {
+/// Replace `mounts: []` in a Lima YAML template with virtiofs mount
+/// entries: `mounts` writable, then `readonly` with `writable: false`.
+/// Returns the modified YAML string.
+fn inject_mounts(
+    yaml: &str,
+    mounts: &[crate::config::Mount],
+    readonly: Option<&ReadonlyMount>,
+) -> Result<String> {
     use std::fmt::Write;
     let mut mount_yaml = String::from("mounts:\n");
     for m in mounts {
@@ -1586,7 +1608,93 @@ fn inject_mounts(yaml: &str, mounts: &[crate::config::Mount]) -> Result<String> 
             "- location: {host}\n  mountPoint: {guest}\n  writable: true\n",
         );
     }
+    if let Some(readonly) = readonly {
+        let _ = writeln!(mount_yaml, "- {}", readonly_mount_entry(readonly)?);
+    }
     Ok(yaml.replace("mounts: []", mount_yaml.trim_end()))
+}
+
+/// The `[readonly_mount]` as a Lima mount entry. Written as a JSON object,
+/// which is both a YAML flow mapping and a yq literal.
+fn readonly_mount_entry(mount: &ReadonlyMount) -> Result<String> {
+    let host = mount
+        .host_path
+        .to_str()
+        .context("readonly_mount.host_path is not valid UTF-8")?;
+    Ok(format!(
+        "{{\"location\": {}, \"mountPoint\": {}, \"writable\": false}}",
+        serde_json::to_string(host)?,
+        serde_json::to_string(mount.guest_path.as_ref())?,
+    ))
+}
+
+/// The `(location, mountPoint)` of each `writable: false` entry in a
+/// `limactl list --json` mount list. coop writes every other mount
+/// `writable: true`, so these are the `[readonly_mount]` ones.
+fn readonly_lima_mounts(mounts: &serde_json::Value) -> Vec<(String, String)> {
+    let field =
+        |mount: &serde_json::Value, key: &str| mount[key].as_str().unwrap_or_default().to_string();
+    mounts
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|mount| mount["writable"].as_bool() == Some(false))
+        .map(|mount| (field(mount, "location"), field(mount, "mountPoint")))
+        .collect()
+}
+
+/// yq expression for `limactl edit --set` that drops every `writable:
+/// false` mount and appends `entry`, if any.
+fn readonly_mount_edit_expression(entry: Option<&str>) -> String {
+    let kept = "[(.mounts // [])[] | select(.writable != false)]";
+    match entry {
+        Some(entry) => format!(".mounts = {kept} + [{entry}]"),
+        None => format!(".mounts = {kept}"),
+    }
+}
+
+/// Bring a stopped instance's mounts in line with the configured
+/// `[readonly_mount]`, so adding, changing, or removing it in
+/// `config.toml` reaches existing instances at their next start.
+///
+/// The edit goes through `limactl edit`, which validates the result and
+/// leaves the rest of `lima.yaml` as it was. Nothing runs when the
+/// instance already matches.
+fn sync_readonly_mount(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+    let info = limactl_info(&inst.name)?;
+    let current = readonly_lima_mounts(&info["config"]["mounts"]);
+    let wanted = match &cfg.readonly_mount {
+        Some(mount) => vec![(
+            mount
+                .host_path
+                .to_str()
+                .context("readonly_mount.host_path is not valid UTF-8")?
+                .to_string(),
+            mount.guest_path.to_string(),
+        )],
+        None => Vec::new(),
+    };
+    if current == wanted {
+        return Ok(());
+    }
+
+    let name = lima_name(inst);
+    let entry = cfg
+        .readonly_mount
+        .as_ref()
+        .map(readonly_mount_entry)
+        .transpose()?;
+    tracing::info!("Updating the read-only mount of Lima instance '{name}'");
+    let status = private_limactl()
+        .args(["edit", &name, "--tty=false", "--set"])
+        .arg(readonly_mount_edit_expression(entry.as_deref()))
+        .stdout(Stdio::null())
+        .status()
+        .context("Failed to run limactl edit")?;
+    if !status.success() {
+        bail!("limactl edit could not update the read-only mount of '{name}'");
+    }
+    Ok(())
 }
 
 fn compose_template_yaml(cfg: &CoopConfig, provision_script: &str) -> String {
@@ -2745,7 +2853,7 @@ mod tests {
             host_path: "/home/user/project".into(),
             guest_path: crate::workspace::default_workspace_path(),
         }];
-        let result = super::inject_mounts(yaml, &mounts).unwrap();
+        let result = super::inject_mounts(yaml, &mounts, None).unwrap();
         assert!(
             result.contains("location: \"/home/user/project\""),
             "missing host path: {result}"
@@ -2777,7 +2885,7 @@ mod tests {
                 guest_path: crate::paths::GuestPath::absolute("/data").unwrap(),
             },
         ];
-        let result = super::inject_mounts(yaml, &mounts).unwrap();
+        let result = super::inject_mounts(yaml, &mounts, None).unwrap();
         assert!(result.contains("location: \"/a\""), "missing /a: {result}");
         assert!(result.contains("location: \"/b\""), "missing /b: {result}");
         assert!(
@@ -2793,7 +2901,7 @@ mod tests {
             host_path: "/x".into(),
             guest_path: crate::paths::GuestPath::absolute("/y").unwrap(),
         }];
-        let result = super::inject_mounts(yaml, &mounts).unwrap();
+        let result = super::inject_mounts(yaml, &mounts, None).unwrap();
         assert!(result.contains("vmType: \"vz\""), "lost vmType: {result}");
         assert!(result.contains("containerd:"), "lost containerd: {result}");
     }
@@ -2813,7 +2921,8 @@ mod tests {
                 host_path: host.into(),
                 guest_path: crate::paths::GuestPath::absolute(guest).unwrap(),
             }];
-            let generated = super::inject_mounts("vmType: vz\nmounts: []\n", &mounts).unwrap();
+            let generated =
+                super::inject_mounts("vmType: vz\nmounts: []\n", &mounts, None).unwrap();
             let parsed: serde_yaml::Value = serde_yaml::from_str(&generated).unwrap();
             let entries = parsed["mounts"].as_sequence().unwrap();
             assert_eq!(entries.len(), 1, "{generated}");
@@ -2825,6 +2934,87 @@ mod tests {
             );
             assert_eq!(entries[0]["writable"].as_bool(), Some(true), "{generated}");
         }
+    }
+
+    fn readonly_mount(host: &str, guest: &str) -> ReadonlyMount {
+        ReadonlyMount {
+            host_path: crate::config::ConfigPath::new(host),
+            guest_path: crate::paths::GuestPath::new(guest),
+        }
+    }
+
+    #[test]
+    fn inject_mounts_appends_readonly_mount_unwritable() {
+        let mounts = [crate::config::Mount {
+            host_path: "/home/user/project".into(),
+            guest_path: crate::workspace::default_workspace_path(),
+        }];
+        for host in ["/srv/docs", "/srv/a \"b\" c\nmounts: []"] {
+            let readonly = readonly_mount(host, "/docs");
+            let generated =
+                super::inject_mounts("vmType: vz\nmounts: []\n", &mounts, Some(&readonly)).unwrap();
+            let parsed: serde_yaml::Value = serde_yaml::from_str(&generated).unwrap();
+            let entries = parsed["mounts"].as_sequence().unwrap();
+            assert_eq!(entries.len(), 2, "{generated}");
+            assert_eq!(entries[0]["writable"].as_bool(), Some(true), "{generated}");
+            assert_eq!(entries[1]["location"].as_str(), Some(host), "{generated}");
+            assert_eq!(entries[1]["mountPoint"].as_str(), Some("/docs"));
+            assert_eq!(entries[1]["writable"].as_bool(), Some(false));
+        }
+    }
+
+    #[test]
+    fn instance_template_written_for_readonly_mount_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let template_path = root.path().join("lima-template.yaml");
+        fs::write(&template_path, "mounts: []\n").unwrap();
+        let mut held = File::open(&template_path).unwrap();
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        let readonly = readonly_mount("/srv/docs", "/docs");
+        let generated =
+            instance_template(&inst, &[], Some(&readonly), &mut held, &template_path).unwrap();
+        assert_ne!(generated, template_path);
+        let content = fs::read_to_string(generated).unwrap();
+        assert!(content.contains("\"writable\": false"), "{content}");
+
+        let mut held = File::open(&template_path).unwrap();
+        let shared = instance_template(&inst, &[], None, &mut held, &template_path).unwrap();
+        assert_eq!(shared, template_path);
+    }
+
+    #[test]
+    fn readonly_lima_mounts_selects_unwritable_entries() {
+        let mounts = serde_json::json!([
+            {"location": "/p", "mountPoint": "/workspace", "writable": true},
+            {"location": "/srv/docs", "mountPoint": "/docs", "writable": false},
+            {"location": "/x"},
+        ]);
+        assert_eq!(
+            super::readonly_lima_mounts(&mounts),
+            vec![("/srv/docs".to_string(), "/docs".to_string())]
+        );
+        assert!(super::readonly_lima_mounts(&serde_json::Value::Null).is_empty());
+    }
+
+    #[test]
+    fn readonly_mount_edit_expression_replaces_unwritable_mounts() {
+        let entry = super::readonly_mount_entry(&readonly_mount("/srv/docs", "/docs")).unwrap();
+        assert_eq!(
+            super::readonly_mount_edit_expression(Some(&entry)),
+            ".mounts = [(.mounts // [])[] | select(.writable != false)] + \
+             [{\"location\": \"/srv/docs\", \"mountPoint\": \"/docs\", \"writable\": false}]"
+        );
+        assert_eq!(
+            super::readonly_mount_edit_expression(None),
+            ".mounts = [(.mounts // [])[] | select(.writable != false)]"
+        );
     }
 
     #[test]
@@ -2901,7 +3091,7 @@ mod tests {
             host_path: root.path().into(),
             guest_path: crate::workspace::default_workspace_path(),
         }];
-        let generated = instance_template(&inst, &mounts, &mut held, &template_path).unwrap();
+        let generated = instance_template(&inst, &mounts, None, &mut held, &template_path).unwrap();
         let content = fs::read_to_string(generated).unwrap();
         assert!(content.contains("# original"));
         assert!(!content.contains("# outside"));

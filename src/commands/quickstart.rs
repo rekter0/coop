@@ -172,6 +172,7 @@ fn quickstart_fresh_start(
             .as_ref()
             .map(|t| t.mounts.clone())
             .unwrap_or_default(),
+        cfg.readonly_mount.as_ref(),
     )?
     .into_vec();
 

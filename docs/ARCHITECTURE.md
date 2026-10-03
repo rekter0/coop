@@ -181,7 +181,9 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
    into the golden image.
 6. **Workspace** — `--workspace` copies via tar-pipe; `--git-repo` clones inside
    the guest; mounts are live on Lima and rsync'd on Firecracker. Persist
-   `WorkspaceState`.
+   `WorkspaceState`. A configured `[readonly_mount]` is already in place by
+   now: the backend attaches it at every boot (a read-only drive built by
+   `vm.rs` on Firecracker, a `writable: false` virtiofs entry on Lima).
 7. **`postStartCommand`** hook (warned, not fatal).
 
 Config, secrets, and workspace all cross the host→guest boundary here; the
@@ -201,7 +203,8 @@ retrieval commands and resolved at VM-start by `resolve_cmd_value`.
 Per-instance runtime state is a set of JSON sidecar files under the instance
 dir: `instance.json`, `vm_config.json`, `workspace.json`, `forwards.json`,
 `guest_env.json`, `model.json`, `proxy.json`, `devcontainer_state.json`, plus
-the Firecracker `.pid`/`.socket`/`.log`/vsock files.
+the Firecracker `.pid`/`.socket`/`.log`/vsock files and, with
+`[readonly_mount]`, its `readonly-mount.ext4` image.
 Allocation refuses an occupied instance path. If any instance directory has
 unreadable metadata, allocation stops because its network index cannot be
 trusted; existing healthy instances remain available through normal lookup.

@@ -38,6 +38,12 @@ Additional host data can be mounted at creation time with
 `coop up --extra-mount HOST_PATH:GUEST_PATH`. In copy mode, extra mounts must
 not target `/workspace`, because the copied project owns that path.
 
+For a directory every VM should read but never change, such as reference
+docs, use the [`[readonly_mount]`](configuration.md#readonly_mount-section)
+config section instead. It applies to every VM, existing ones included, and
+the guest cannot write to it even as root. On Linux/Firecracker coop rebuilds
+it from the host directory at each boot; on macOS/Lima it is live.
+
 `coop up --git-repo <url>` clones the repository inside the guest at
 `/workspace` and records the original URL in `workspace.json`. Because there
 is no host workspace path for that source, later `push` and `pull` commands

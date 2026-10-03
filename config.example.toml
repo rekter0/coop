@@ -48,6 +48,11 @@
 # RUST_LOG = "info"
 # MY_FLAG = "1"
 
+# [readonly_mount]              # Host directory every VM sees read-only.
+# host_path = "~/coop-docs"     # Must exist. Firecracker copies it into each
+#                               # VM at boot; Lima shows it live.
+# guest_path = "/docs"          # Absolute; not / and not under /workspace.
+
 # [claude]
 # Copies CLAUDE.md, keybindings.json, rules/, commands/, skills/, agents/,
 # output-styles/, themes/, workflows/ (complete bundles; follows symlinks).

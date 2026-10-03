@@ -355,7 +355,8 @@ fn create_up_instance(
             (None, workspace::WorkspaceMountRule::ProjectMountedOrNone)
         }
     };
-    let mounts = workspace::ValidatedMounts::assemble(rule, mounts)?.into_vec();
+    let mounts =
+        workspace::ValidatedMounts::assemble(rule, mounts, cfg.readonly_mount.as_ref())?.into_vec();
 
     let start_opts = StartOpts {
         name: None,
@@ -439,9 +440,12 @@ fn create_git_repo_instance(
         .map(|t| t.mounts.clone())
         .unwrap_or_default();
     mounts.extend(opts.extra_mount.clone());
-    let mounts =
-        workspace::ValidatedMounts::assemble(workspace::WorkspaceMountRule::GitRepoClone, mounts)?
-            .into_vec();
+    let mounts = workspace::ValidatedMounts::assemble(
+        workspace::WorkspaceMountRule::GitRepoClone,
+        mounts,
+        cfg.readonly_mount.as_ref(),
+    )?
+    .into_vec();
 
     let start_opts = StartOpts {
         name: None,
@@ -3747,6 +3751,7 @@ mod tests {
         let err = crate::workspace::ValidatedMounts::assemble(
             crate::workspace::WorkspaceMountRule::CopyProject,
             mounts,
+            None,
         )
         .expect_err("expected /workspace collision");
         assert!(format!("{err}").contains("/workspace"));

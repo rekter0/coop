@@ -457,6 +457,73 @@ pub(crate) fn validate_unique_guest_paths(mounts: &[Mount]) -> Result<()> {
     Ok(())
 }
 
+/// `[readonly_mount]`: a host directory that every VM sees, read-only, at
+/// `guest_path` on every boot.
+///
+/// The read-only guarantee is enforced outside the guest, so guest root
+/// cannot lift it: Firecracker attaches a read-only drive rebuilt from
+/// `host_path` at each boot; Lima mounts `host_path` live with virtiofs
+/// `writable: false`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawReadonlyMount")]
+pub struct ReadonlyMount {
+    pub host_path: ConfigPath,
+    pub guest_path: GuestPath,
+}
+
+#[derive(Deserialize)]
+struct RawReadonlyMount {
+    host_path: ConfigPath,
+    guest_path: String,
+}
+
+impl TryFrom<RawReadonlyMount> for ReadonlyMount {
+    type Error = anyhow::Error;
+
+    fn try_from(raw: RawReadonlyMount) -> Result<Self> {
+        anyhow::ensure!(
+            raw.host_path.is_absolute(),
+            "readonly_mount.host_path must be absolute or start with ~: '{}'",
+            raw.host_path.display()
+        );
+        anyhow::ensure!(
+            !raw.host_path
+                .to_string_lossy()
+                .chars()
+                .any(char::is_control),
+            "readonly_mount.host_path must not contain control characters"
+        );
+        Ok(Self {
+            host_path: raw.host_path,
+            guest_path: readonly_mount_guest_path(&raw.guest_path)?,
+        })
+    }
+}
+
+/// Parse `readonly_mount.guest_path`: absolute, made of plain components
+/// (no empty, `.`, or `..` segment, so not `/` itself), free of control
+/// characters, and clear of `/workspace`, which the project transport owns.
+fn readonly_mount_guest_path(path: &str) -> Result<GuestPath> {
+    let guest = GuestPath::absolute(path)
+        .with_context(|| format!("readonly_mount.guest_path must be absolute: '{path}'"))?;
+    anyhow::ensure!(
+        !path.chars().any(char::is_control),
+        "readonly_mount.guest_path must not contain control characters"
+    );
+    anyhow::ensure!(
+        path[1..]
+            .split('/')
+            .all(|component| !matches!(component, "" | "." | "..")),
+        "readonly_mount.guest_path must be a normalized directory below /: '{path}'"
+    );
+    let workspace = crate::workspace::default_workspace_path();
+    anyhow::ensure!(
+        !guest.overlaps(&workspace),
+        "readonly_mount.guest_path must not be {workspace} or inside it: '{path}'"
+    );
+    Ok(guest)
+}
+
 /// A guest port to forward to the host for the lifetime of the VM.
 ///
 /// Construction normalizes the spec so downstream code (SSH `-L` flags)
@@ -770,6 +837,10 @@ pub struct CoopConfig {
     /// earlier ones with the same guest port.
     #[serde(default)]
     pub forward_ports: Vec<PortForward>,
+
+    /// Host directory mounted read-only into every VM.
+    #[serde(default)]
+    pub readonly_mount: Option<ReadonlyMount>,
 
     /// Self-update behaviour
     #[serde(default)]
@@ -2244,6 +2315,15 @@ impl CoopConfig {
             ));
         }
 
+        if let Some(mount) = &self.readonly_mount
+            && !mount.host_path.is_dir()
+        {
+            errors.push(format!(
+                "readonly_mount.host_path '{}' does not exist or is not a directory",
+                mount.host_path.display()
+            ));
+        }
+
         if self.codex.auth.uses_chatgpt_account() && self.proxy.openai.is_some() {
             errors.push(
                 "codex.auth = \"chatgpt\" conflicts with [proxy.openai]; \
@@ -2590,6 +2670,7 @@ impl Default for CoopConfig {
             profiles: HashMap::new(),
             post_start: None,
             forward_ports: Vec::new(),
+            readonly_mount: None,
             updates: crate::update::UpdateConfig::default(),
         }
     }
@@ -2697,6 +2778,11 @@ pub struct Instance {
 impl Instance {
     pub fn rootfs_path(&self) -> PathBuf {
         self.dir.join("rootfs.ext4")
+    }
+
+    /// Firecracker's read-only `[readonly_mount]` drive, rebuilt at each boot.
+    pub fn readonly_mount_image_path(&self) -> PathBuf {
+        self.dir.join("readonly-mount.ext4")
     }
 
     pub fn pid_file_path(&self) -> PathBuf {
@@ -5718,6 +5804,101 @@ skip = ["not-a-slug"]
         let tmp = TempDir::new().unwrap();
         let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
         assert!(!m.host_is_git_repo());
+    }
+
+    // ── [readonly_mount] ─────────────────────────────────────
+
+    fn parse_readonly_mount(host: &str, guest: &str) -> Result<ReadonlyMount> {
+        let toml = format!(
+            "[readonly_mount]\nhost_path = {}\nguest_path = {}\n",
+            toml::Value::from(host),
+            toml::Value::from(guest)
+        );
+        let cfg: CoopConfig = toml::from_str(&toml).map_err(anyhow::Error::from)?;
+        Ok(cfg.readonly_mount.unwrap())
+    }
+
+    #[test]
+    fn readonly_mount_is_absent_by_default() {
+        let cfg: CoopConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.readonly_mount, None);
+    }
+
+    #[test]
+    fn readonly_mount_parses_absolute_paths() {
+        let mount = parse_readonly_mount("/srv/docs", "/docs").unwrap();
+        assert_eq!(mount.host_path, ConfigPath::new("/srv/docs"));
+        assert_eq!(mount.guest_path, GuestPath::new("/docs"));
+    }
+
+    #[test]
+    fn readonly_mount_expands_tilde_host_path() {
+        let mount = parse_readonly_mount("~/docs", "/docs").unwrap();
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(*mount.host_path, *home.join("docs"));
+    }
+
+    #[test]
+    fn readonly_mount_rejects_relative_host_path() {
+        let err = parse_readonly_mount("docs", "/docs").unwrap_err();
+        assert!(err.to_string().contains("must be absolute"), "{err}");
+    }
+
+    #[test]
+    fn readonly_mount_rejects_control_characters() {
+        let err = parse_readonly_mount("/srv/do\ncs", "/docs").unwrap_err();
+        assert!(err.to_string().contains("host_path"), "{err}");
+        let err = parse_readonly_mount("/srv/docs", "/do\tcs").unwrap_err();
+        assert!(err.to_string().contains("control characters"), "{err}");
+    }
+
+    #[test]
+    fn readonly_mount_rejects_unnormalized_guest_paths() {
+        for guest in ["docs", "/", "/docs/", "//docs", "/a/./b", "/a/../b"] {
+            assert!(
+                parse_readonly_mount("/srv/docs", guest).is_err(),
+                "accepted guest_path {guest:?}"
+            );
+        }
+        parse_readonly_mount("/srv/docs", "/opt/ref docs").unwrap();
+    }
+
+    #[test]
+    fn readonly_mount_rejects_workspace_overlap() {
+        for guest in ["/workspace", "/workspace/docs"] {
+            let err = parse_readonly_mount("/srv/docs", guest).unwrap_err();
+            assert!(err.to_string().contains("/workspace"), "{err}");
+        }
+        parse_readonly_mount("/srv/docs", "/workspace-docs").unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_missing_readonly_mount_host_path() {
+        let cfg = CoopConfig {
+            readonly_mount: Some(ReadonlyMount {
+                host_path: ConfigPath::new("/nonexistent/docs"),
+                guest_path: GuestPath::new("/docs"),
+            }),
+            ..CoopConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("readonly_mount.host_path"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_passes_with_existing_readonly_mount_host_path() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = CoopConfig {
+            readonly_mount: Some(ReadonlyMount {
+                host_path: ConfigPath::new(tmp.path()),
+                guest_path: GuestPath::new("/docs"),
+            }),
+            ..CoopConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 
     // ── ConfigDir deserialization ────────────────────────────

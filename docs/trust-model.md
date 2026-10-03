@@ -88,6 +88,27 @@ user launched it.
 - **OCI feature blobs.** `devcontainer_oci.rs` pulls devcontainer *Features*
   from GHCR; the install snippet runs **in the guest**, not the host.
 
+## Host data shared read-only into guests
+
+`[readonly_mount]` shows one host directory, chosen in `config.toml`, to every
+VM. Data flows host→guest only, and the read-only guarantee must not depend on
+anything inside the guest, because guest root can change any guest setting:
+
+- **Firecracker**: coop builds `readonly-mount.ext4` in the instance directory
+  with `mkfs.ext4 -d`, running as the host user, before each boot. It attaches
+  the image with `is_read_only: true`, so the virtio-blk device refuses writes
+  regardless of how the guest mounts it. `mkfs.ext4` copies symlinks as links
+  and does not follow them, so the image cannot pull in host files from
+  outside `host_path`.
+- **Lima**: the mount is a virtiofs share with `writable: false`, and
+  Virtualization.framework refuses writes on the host side.
+
+Every VM reads the same content, so a secret placed there reaches all of them.
+If anything guest-authored is copied into `host_path` (for example by `coop
+pull`), that content reaches every other VM at its next boot. On the host it
+is only copied as data by `mkfs.ext4` or served by virtiofs; nothing on the
+host interprets it.
+
 ## Host subprocess boundary
 
 For every tainted input that reaches a host subprocess, trace its origin through

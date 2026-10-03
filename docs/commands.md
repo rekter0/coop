@@ -53,7 +53,7 @@ Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
 | `--new-instance` | Create a separate instance even when the project already has one (requires `--name`) |
 | `--copy` | Copy/sync `DIR` into `/workspace` (default) |
 | `--mount` | Mount `DIR` at `/workspace` instead of using `--copy` |
-| `--extra-mount <spec>` | Additional host directory to mount into the guest (`HOST_PATH[:GUEST_PATH]`, repeatable; specify a guest path other than `/workspace` when using `--copy`) |
+| `--extra-mount <spec>` | Additional host directory to mount into the guest (`HOST_PATH[:GUEST_PATH]`, repeatable; specify a guest path other than `/workspace` when using `--copy`, and one that does not overlap the [`[readonly_mount]`](configuration.md#readonly_mount-section) guest path) |
 | `--git-repo <url>` | Clone a git repository into `/workspace` instead of copying a local project directory |
 | `--vcpus <N>` | Number of vCPUs when creating a new instance |
 | `--mem <MiB>` | Memory in MiB when creating a new instance |
@@ -945,6 +945,7 @@ Kept across the wipe, because coop persists them host-side:
 | Guest env, including a devcontainer's `containerEnv` | `guest_env.json` |
 | Model mode and proxy settings | `model.json` / `proxy.json` |
 | Credentials saved in the host secret store | unchanged; guest forwarding depends on the configured auth mode |
+| `[readonly_mount]` | `config.toml`, applied at every boot |
 
 **Not replayed**, because coop does not persist them:
 
