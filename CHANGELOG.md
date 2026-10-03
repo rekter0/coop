@@ -58,6 +58,15 @@
   Guest root cannot write to it or remount it writable. `--extra-mount` and
   devcontainer mounts that overlap its guest path are rejected.
 
+### Fixes
+
+- **`coop ssh-config` / `coop editor` aliases** — the `coop-<name>` block now
+  goes just above the first `Host`/`Match` line of `~/.ssh/config` instead of
+  at the end, so a `Host *` section with its own `User`, `Port`, or
+  `IdentityFile` no longer overrides the alias. Blocks written by older
+  versions move into place the next time the alias is written or the VM
+  restarts.
+
 ## v0.6.0
 
 ### Upgrading from v0.5.4

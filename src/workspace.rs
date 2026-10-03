@@ -1135,23 +1135,65 @@ fn update_ssh_config(target: &SshTarget, inst: &Instance) -> Result<()> {
         String::new()
     };
 
-    let cleaned = remove_named_marker_block(&existing, &host);
-    let new_content = if cleaned.is_empty() {
-        format!("{block}\n")
-    } else {
-        format!("{cleaned}\n{block}\n")
-    };
-
+    let new_content = place_marker_block(&existing, &host, &block);
     atomic_write(&ssh_config, &new_content).context("Failed to write ~/.ssh/config")?;
 
     tracing::info!("Updated SSH config at {}", ssh_config.display());
     Ok(())
 }
 
-/// Remove all coop marker blocks from SSH config.
+/// Put `block` (the marker block for `host`) where ssh will read it before
+/// the user's own sections: just above the first `Host` or `Match` line.
+///
+/// ssh takes the first value it finds for each option, so a block appended
+/// after a user's `Host *` loses `User`, `Port`, and `IdentityFile` to it.
+/// The block cannot go above that first section either: until the next
+/// `Host`/`Match`, every line belongs to the block's host, which would
+/// silently scope the user's global options to the coop alias. With no
+/// section in the file, the block is appended. Any existing block for
+/// `host`, wherever it is, is removed first, so rewriting is idempotent and
+/// moves a block written by an older coop into place.
+fn place_marker_block(content: &str, host: &str, block: &str) -> String {
+    let cleaned = remove_named_marker_block(content, host);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let Some(first_section) = lines.iter().position(|line| starts_ssh_section(line)) else {
+        return if cleaned.is_empty() {
+            format!("{block}\n")
+        } else {
+            format!("{cleaned}\n{block}\n")
+        };
+    };
+    let mut out = String::new();
+    for line in &lines[..first_section] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(block);
+    out.push_str("\n\n");
+    for line in &lines[first_section..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether `line` opens an `ssh_config` section: a `Host` or `Match` keyword,
+/// matched case-insensitively and followed by whitespace or `=`.
+fn starts_ssh_section(line: &str) -> bool {
+    let keyword = line
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == '=')
+        .next()
+        .unwrap_or_default();
+    keyword.eq_ignore_ascii_case("host") || keyword.eq_ignore_ascii_case("match")
+}
+
+/// Remove all coop marker blocks from SSH config, each with the blank line
+/// [`place_marker_block`] puts after it.
 fn remove_marker_blocks(content: &str) -> String {
     let mut result = String::new();
     let mut in_block = false;
+    let mut after_block = false;
 
     for line in content.lines() {
         if line.trim().starts_with(MARKER_PREFIX) {
@@ -1160,6 +1202,10 @@ fn remove_marker_blocks(content: &str) -> String {
         }
         if line.trim() == MARKER_END {
             in_block = false;
+            after_block = true;
+            continue;
+        }
+        if std::mem::take(&mut after_block) && line.trim().is_empty() {
             continue;
         }
         if !in_block {
@@ -1176,11 +1222,13 @@ fn remove_marker_blocks(content: &str) -> String {
     }
 }
 
-/// Remove the marker block for a specific instance host name.
+/// Remove the marker block for a specific instance host name, with the
+/// blank line [`place_marker_block`] puts after it.
 fn remove_named_marker_block(content: &str, host: &str) -> String {
     let target_marker = format!("{MARKER_PREFIX} {host}");
     let mut result = String::new();
     let mut in_block = false;
+    let mut after_block = false;
 
     for line in content.lines() {
         if line.trim() == target_marker {
@@ -1189,6 +1237,10 @@ fn remove_named_marker_block(content: &str, host: &str) -> String {
         }
         if in_block && line.trim() == MARKER_END {
             in_block = false;
+            after_block = true;
+            continue;
+        }
+        if std::mem::take(&mut after_block) && line.trim().is_empty() {
             continue;
         }
         if !in_block {
@@ -2078,6 +2130,93 @@ Host coop-b\n\
         assert!(!result.contains("coop-a"));
         assert!(result.contains("coop-b"));
         assert!(result.contains("172.16.0.3"));
+    }
+
+    const USER_CONFIG: &str = "\
+# my settings
+ServerAliveInterval 30
+
+Host *
+    User root
+    IdentityFile ~/.ssh/id_rsa
+";
+
+    const COOP_BLOCK: &str = "\
+# coop START coop-a
+Host coop-a
+    User ubuntu
+# coop END";
+
+    #[test]
+    fn place_marker_block_goes_before_the_first_section() {
+        let placed = place_marker_block(USER_CONFIG, "coop-a", COOP_BLOCK);
+        assert_eq!(
+            placed,
+            "\
+# my settings
+ServerAliveInterval 30
+
+# coop START coop-a
+Host coop-a
+    User ubuntu
+# coop END
+
+Host *
+    User root
+    IdentityFile ~/.ssh/id_rsa
+"
+        );
+    }
+
+    #[test]
+    fn place_marker_block_is_idempotent_and_reversible() {
+        let once = place_marker_block(USER_CONFIG, "coop-a", COOP_BLOCK);
+        assert_eq!(place_marker_block(&once, "coop-a", COOP_BLOCK), once);
+        assert_eq!(remove_named_marker_block(&once, "coop-a"), USER_CONFIG);
+        assert_eq!(remove_marker_blocks(&once), USER_CONFIG);
+    }
+
+    #[test]
+    fn place_marker_block_moves_a_block_appended_by_older_coop() {
+        let legacy = format!("{USER_CONFIG}\n{COOP_BLOCK}\n");
+        assert_eq!(
+            place_marker_block(&legacy, "coop-a", COOP_BLOCK),
+            place_marker_block(USER_CONFIG, "coop-a", COOP_BLOCK)
+        );
+    }
+
+    #[test]
+    fn place_marker_block_appends_without_sections() {
+        assert_eq!(
+            place_marker_block("", "coop-a", COOP_BLOCK),
+            format!("{COOP_BLOCK}\n")
+        );
+        assert_eq!(
+            place_marker_block("ServerAliveInterval 30\n", "coop-a", COOP_BLOCK),
+            format!("ServerAliveInterval 30\n\n{COOP_BLOCK}\n")
+        );
+    }
+
+    #[test]
+    fn starts_ssh_section_matches_whole_keywords() {
+        for line in [
+            "Host *",
+            "host foo",
+            "  Match all",
+            "Host=foo",
+            "MATCH\tuser x",
+        ] {
+            assert!(starts_ssh_section(line), "{line:?}");
+        }
+        for line in [
+            "HostName 1.2.3.4",
+            "# Host foo",
+            "",
+            "    User root",
+            "Hosts x",
+        ] {
+            assert!(!starts_ssh_section(line), "{line:?}");
+        }
     }
 
     #[test]

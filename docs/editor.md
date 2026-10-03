@@ -79,6 +79,8 @@ Host coop-my-instance
 
 Each run of `coop editor` replaces the existing block for that instance, or creates one if none exists. To install the same block without launching an editor — for plain `ssh`/`scp`/`rsync` — use [`coop ssh-config`](commands.md#ssh-config).
 
+The block goes just above the first `Host` or `Match` line in the file (at the end if there is none). ssh uses the first value it finds for each option, so this keeps a catch-all such as `Host *` with `User root` from overriding the alias. The block does not go above that point: options there, before any `Host`, apply to every host, including the alias, and moving the block above them would change what they apply to. Writing the block also moves one left at the end of the file by an older coop.
+
 ### Cleanup
 
 - **`coop editor NAME --clean`** (or **`coop ssh-config NAME --clean`**) removes the SSH config entry for the specified instance and exits. This cleans up the config without destroying the instance.
