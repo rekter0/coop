@@ -66,6 +66,15 @@
   `IdentityFile` no longer overrides the alias. Blocks written by older
   versions move into place the next time the alias is written or the VM
   restarts.
+- **`rust` profile** — `cargo` and `rustc` now work for the guest user. rustup
+  used to install into `/root` (profile scripts run as root before the guest
+  user exists), leaving proxies in `/usr/local/bin` that could not find a
+  toolchain. The profile now installs into `/usr/local/rustup` and
+  `/usr/local/cargo`, owned by the guest user, adds `rust-analyzer` for the
+  profile's LSP plugin, and sets `RUSTUP_HOME`, `CARGO_HOME`, and `PATH` in
+  `/etc/environment`. Images built with `rust` are rebuilt automatically by
+  the next `coop setup` or `coop up --profile`; existing VMs keep the old
+  install until recreated or `coop restore --reprovision`ed.
 
 ## v0.6.0
 

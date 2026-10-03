@@ -82,7 +82,7 @@ coop setup --profile python,node,rust
 | `node` | `nodejs` (NodeSource repository added via pre-install script) |
 | `c` | `clang`, `llvm`, `gdb`, `valgrind`, `cmake`. Installs plugin: `clangd-lsp@claude-plugins-official` |
 | `fuzz` | `clang`, `llvm`, `afl++`, `lcov` |
-| `rust` | Rust toolchain via post-install script (not apt). Installs plugin: `rust-analyzer-lsp@claude-plugins-official` |
+| `rust` | Stable Rust toolchain and `rust-analyzer` via rustup (not apt), in `/usr/local/rustup` and `/usr/local/cargo`, owned by the guest user so `rustup update` and `cargo install` work without sudo. `RUSTUP_HOME`, `CARGO_HOME`, and `PATH` are set in `/etc/environment`. Installs plugin: `rust-analyzer-lsp@claude-plugins-official` |
 | `go` | `golang` |
 
 Plugins listed above are baked into the golden image during `coop setup` and do not need to be listed separately in config.

@@ -2993,11 +2993,29 @@ test_profiles() {
                 fi
                 ;;
             rust)
-                # Rust is installed for the ubuntu user via rustup
-                if guest_exec rustc --version >/dev/null; then
-                    pass "rustc installed (profile: rust)"
+                # rustup installs into /usr/local/{rustup,cargo}, owned by
+                # the guest user and published through /etc/environment.
+                if guest_exec rustc --version >/dev/null \
+                    && guest_exec cargo --version >/dev/null \
+                    && guest_exec rust-analyzer --version >/dev/null; then
+                    pass "rustc, cargo, rust-analyzer installed (profile: rust)"
                 else
-                    fail "rustc installed (profile: rust)" "stderr: $(guest_stderr)"
+                    fail "rustc, cargo, rust-analyzer installed (profile: rust)" \
+                        "stderr: $(guest_stderr)"
+                fi
+                if guest_exec sh -c 'test -w "$CARGO_HOME/bin" && test -w "$RUSTUP_HOME/toolchains"'; then
+                    pass "guest user owns the Rust toolchain (profile: rust)"
+                else
+                    fail "guest user owns the Rust toolchain (profile: rust)" \
+                        "stderr: $(guest_stderr)"
+                fi
+                local rust_out
+                if rust_out=$(guest_exec sh -c 'cd "$(mktemp -d)" && cargo new -q --vcs none hello && cd hello && cargo run -q --offline') \
+                    && [[ "$rust_out" == *"Hello, world!"* ]]; then
+                    pass "cargo builds and runs a crate (profile: rust)"
+                else
+                    fail "cargo builds and runs a crate (profile: rust)" \
+                        "got: $rust_out; stderr: $(guest_stderr)"
                 fi
                 ;;
             go)
