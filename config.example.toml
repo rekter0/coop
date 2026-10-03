@@ -160,6 +160,25 @@
 # args = ["-y", "@example/mcp-server"]
 # env = { API_KEY = "MY_HOST_ENV_VAR" }
 
+# [pi]
+# Copies AGENTS.md, AGENTS.override.md, CLAUDE.md, SYSTEM.md, APPEND_SYSTEM.md,
+# keybindings.json, models.json, the auth.json credential store (0600), and
+# extensions/, skills/, prompts/, themes/. Skips directory symlinks, hidden
+# dirs, and *.git. Host settings.json is merged except `packages`; host
+# mcp.json servers are merged. Restarts overlay files; host deletions/false
+# retain copies.
+# config_dir = "~/.pi/agent"  # custom source path, or false to stop copying
+# env_forward = ["OPENROUTER_API_KEY"]  # Provider keys beyond Anthropic/OpenAI/xAI
+# packages = ["npm:@example/pi-tools@1.0.0", "git:github.com/example/pi-skills@v1"]
+#
+# pi reads ANTHROPIC_API_KEY, OPENAI_API_KEY, and XAI_API_KEY, which coop
+# already forwards. Without a host auth.json, sign in with /login in `coop pi`.
+
+# [pi.mcp_servers.my-server]  # stdio or type = "http"; pi rejects "sse"
+# command = "npx"
+# args = ["-y", "@example/mcp-server"]
+# env = { API_KEY = "MY_HOST_ENV_VAR" }
+
 # [proxy]                           # Host-side credential-injecting proxy
 #                                   # (issue #411). Opt-in: when set, coop runs
 #                                   # a `coop-proxy` process on the host and the

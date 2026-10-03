@@ -4,7 +4,7 @@ coop reads configuration from `~/.coop/config.toml` by default. Pass `--config <
 
 If the file does not exist, coop falls back to built-in defaults. A valid minimal config is an empty file.
 
-A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, `grok.config_dir`, `omp.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `grok.marketplaces` / `omp.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
+A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, `grok.config_dir`, `omp.config_dir`, `pi.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `grok.marketplaces` / `omp.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
 
 Run `coop validate` to surface errors and warnings before anything touches a VM.
 
@@ -367,6 +367,19 @@ omp (oh-my-pi) configuration injected into the guest VM at start time. Every fie
 | `mcp_servers` | table | `{}` | MCP servers to merge into the guest `~/.omp/agent/mcp.json`, replacing same-named guest and host entries. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
 
 A copied host `agent.db` is set to owner-only (`0600`) on the guest and signs the guest in with every provider stored there; any older guest `agent.db-wal` is removed first. Otherwise sign in with `coop omp -- login`.
+
+## `pi` section
+
+pi configuration injected into the guest VM at start time. Every field is optional. pi has no `api_key` field: it reads provider keys from the environment, and `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `XAI_API_KEY` are already forwarded through the `claude`, `codex`, and `grok` sections.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `config_dir` | string (path) or `false` | `~/.pi/agent` | Source for `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `SYSTEM.md`, `APPEND_SYSTEM.md`, `keybindings.json`, `models.json`, the `auth.json` credential store, and `extensions/`, `skills/`, `prompts/`, `themes/`, overlaid into guest `~/.pi/agent/` on each start. Host `settings.json` (except `packages`) and `mcp.json` servers are merged into the guest files. Directory symlinks, hidden directories, and bare git repos stay on the host. Supports `~` expansion; `false` stops copying while retaining prior files. Host deletions do not delete guest files. See [config directory](pi-integration.md#config-directory). |
+| `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`, such as `OPENROUTER_API_KEY` or `GEMINI_API_KEY`. |
+| `packages` | array of strings | `[]` | pi packages to install in the guest with `pi install`: `npm:<package>[@version]`, `git:<host>/<repo>[@ref]`, or a git URL. Local paths are rejected. Baked into the golden image and delta-installed on first boot. |
+| `mcp_servers` | table | `{}` | MCP servers to merge into the guest `~/.pi/agent/mcp.json`, replacing same-named guest and host entries. `type = "sse"` is rejected because pi does not support it. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
+
+A copied host `auth.json` is set to owner-only (`0600`) on the guest and signs the guest in with every provider stored there. Otherwise sign in with `/login` inside `coop pi`.
 
 ## Local-model routing
 

@@ -128,6 +128,13 @@ impl GuestUser {
     pub fn omp_bin(&self) -> GuestPath {
         GuestPath::new(format!("/home/{}/.local/bin/omp", self.0))
     }
+
+    /// Where coop's pi installer links the per-user binary. npm installs the
+    /// package under the guest user's `~/.local` prefix, so `pi update` can
+    /// reinstall it without sudo.
+    pub fn pi_bin(&self) -> GuestPath {
+        GuestPath::new(format!("/home/{}/.local/bin/pi", self.0))
+    }
 }
 
 /// Stable system path linking to the guest user's native Codex launcher.
@@ -249,6 +256,7 @@ pub const SCRIPT_CODEX: &str = include_str!("../scripts/guest/codex.sh");
 pub const SCRIPT_CODEX_ACCOUNT: &str = include_str!("../scripts/guest/codex-account.sh");
 pub const SCRIPT_GROK: &str = include_str!("../scripts/guest/grok.sh");
 pub const SCRIPT_OMP: &str = include_str!("../scripts/guest/omp.sh");
+pub const SCRIPT_PI: &str = include_str!("../scripts/guest/pi.sh");
 
 /// Packages installed into every golden image.
 ///
@@ -663,6 +671,27 @@ mod tests {
             assert!(
                 SCRIPT_OMP.contains(expected),
                 "omp installer is missing {expected:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn pi_script_installs_node_and_a_user_prefix_npm_package() {
+        for expected in [
+            // Node 22.19+ is required; an older or missing node gets NodeSource.
+            "(major === 22 && minor >= 19)",
+            "https://deb.nodesource.com/setup_22.x",
+            // A guest-owned prefix is what lets `pi update` run without sudo.
+            "PI_PREFIX=\"/home/${GUEST_USER}/.local\"",
+            "npm install -g --ignore-scripts --no-fund --no-audit --prefix '${PI_PREFIX}' @earendil-works/pi-coding-agent",
+            "su - \"$GUEST_USER\" -c \"'$PI_BIN' --version\"",
+            // The shortcut keeps subcommands first, as pi requires.
+            "auth | install | remove | uninstall | update | list | config | mcp) exec pi \"$@\" ;;",
+            "exec pi --approve \"$@\"",
+        ] {
+            assert!(
+                SCRIPT_PI.contains(expected),
+                "pi installer is missing {expected:?}",
             );
         }
     }

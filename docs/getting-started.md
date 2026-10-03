@@ -1,6 +1,6 @@
 # Getting Started
 
-coop runs Claude Code, Codex, Grok Build, and omp inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. Each VM gets its own filesystem, network stack, and Docker daemon. Agent CLIs never touch your host.
+coop runs Claude Code, Codex, Grok Build, omp, and pi inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. Each VM gets its own filesystem, network stack, and Docker daemon. Agent CLIs never touch your host.
 
 ## Prerequisites
 
@@ -200,6 +200,9 @@ config_dir = "~/.grok"
 
 [omp]
 config_dir = "~/.omp/agent"
+
+[pi]
+config_dir = "~/.pi/agent"
 ```
 
 The `github` field controls how coop resolves a GitHub token for the guest:
@@ -215,8 +218,8 @@ coop picks up `ANTHROPIC_API_KEY`, `XAI_API_KEY`, and, in the default Codex
 API-key mode, `OPENAI_API_KEY` from your environment automatically. Setting
 them explicitly under `claude.api_key`, `codex.api_key`, or `grok.api_key`
 also works, but environment variables are preferred.
-omp reads the same three keys; list any other provider key it needs under
-`[omp] env_forward`.
+omp and pi read the same three keys; list any other provider key they need
+under `[omp] env_forward` or `[pi] env_forward`.
 
 For Codex account or workspace access without OpenAI API billing, set
 `[codex] auth = "chatgpt"` and rebuild any old image with `coop setup
@@ -319,6 +322,7 @@ coop claude
 coop codex
 coop grok
 coop omp
+coop pi
 ```
 
 ### 3. Restart a stopped instance
@@ -351,7 +355,7 @@ coop up ~/code/my-project --profile python,node
 coop up --git-repo https://github.com/trailofbits/coop.git
 ```
 
-Skip Claude Code, Codex, Grok Build, and omp credential/config injection:
+Skip Claude Code, Codex, Grok Build, omp, and pi credential/config injection:
 
 ```
 coop start my-project --no-agents
@@ -430,6 +434,17 @@ guest:
 ```
 coop omp -- login
 ```
+
+**Launch pi inside the VM:**
+
+```
+coop pi
+```
+
+coop launches `pi --approve`, which trusts the project's `.pi/` files; pi
+does not prompt per tool. Pass `--ask` to keep pi's project-trust prompt. A
+host `~/.pi/agent/auth.json` is copied into the guest on boot, so host logins
+carry over. Otherwise run `/login` inside `coop pi`.
 
 **Open a shell in the VM:**
 
@@ -548,6 +563,7 @@ coop images --delete python-dev
 - [Codex integration](codex-integration.md)
 - [Grok Build integration](grok-integration.md)
 - [omp integration](omp-integration.md)
+- [pi integration](pi-integration.md)
 - [Editor integration](editor.md)
 - [Running multiple instances](multi-instance.md)
 - [Platform backends](backends.md)

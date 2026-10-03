@@ -110,7 +110,7 @@ pub fn reject_overrides<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<
     for name in names {
         if matches!(name, "GITHUB_TOKEN" | "GH_TOKEN") {
             bail!(
-                "VM PAT assignment conflicts with managed {name}; remove it from guest_env, env_forward, a Grok or omp stdio MCP env mapping, and persisted guest_env.json (including --env/containerEnv), or unassign the PAT"
+                "VM PAT assignment conflicts with managed {name}; remove it from guest_env, env_forward, a Grok, omp, or pi stdio MCP env mapping, and persisted guest_env.json (including --env/containerEnv), or unassign the PAT"
             );
         }
     }
@@ -383,28 +383,34 @@ mod tests {
     }
 
     #[test]
-    fn assignment_rejects_omp_token_forwarding() {
-        for name in ["GITHUB_TOKEN", "GH_TOKEN"] {
-            for source in 0..2 {
-                let (_tmp, mut cfg, inst) = fixture();
-                assign(&cfg, &inst);
-                let key = EnvVarName::new(name).unwrap();
-                if source == 0 {
-                    cfg.omp.env_forward.push(key);
-                } else {
-                    let mut env = std::collections::BTreeMap::new();
-                    env.insert(EnvVarName::new("TOKEN").unwrap(), key);
-                    cfg.omp.mcp_servers.insert(
-                        "tool".into(),
-                        crate::config::McpServerDef::Stdio {
-                            command: "npx".into(),
-                            args: vec![],
-                            env,
-                        },
-                    );
+    fn assignment_rejects_omp_and_pi_token_forwarding() {
+        for agent in ["omp", "pi"] {
+            for name in ["GITHUB_TOKEN", "GH_TOKEN"] {
+                for source in 0..2 {
+                    let (_tmp, mut cfg, inst) = fixture();
+                    assign(&cfg, &inst);
+                    let (env_forward, mcp_servers) = match agent {
+                        "omp" => (&mut cfg.omp.env_forward, &mut cfg.omp.mcp_servers),
+                        _ => (&mut cfg.pi.env_forward, &mut cfg.pi.mcp_servers),
+                    };
+                    let key = EnvVarName::new(name).unwrap();
+                    if source == 0 {
+                        env_forward.push(key);
+                    } else {
+                        let mut env = std::collections::BTreeMap::new();
+                        env.insert(EnvVarName::new("TOKEN").unwrap(), key);
+                        mcp_servers.insert(
+                            "tool".into(),
+                            crate::config::McpServerDef::Stdio {
+                                command: "npx".into(),
+                                args: vec![],
+                                env,
+                            },
+                        );
+                    }
+                    let err = session_token(&cfg, &inst, None).unwrap_err().to_string();
+                    assert!(err.contains(name), "{agent}: {err}");
                 }
-                let err = session_token(&cfg, &inst, None).unwrap_err().to_string();
-                assert!(err.contains(name), "{err}");
             }
         }
     }

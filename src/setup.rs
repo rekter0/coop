@@ -77,6 +77,8 @@ pub struct TemplateConfig {
     #[serde(default)]
     pub omp_plugins: Vec<String>,
     #[serde(default)]
+    pub pi_packages: Vec<String>,
+    #[serde(default)]
     pub guest_user: GuestUser,
     #[serde(default)]
     pub oci_features: Vec<InstalledFeature>,
@@ -111,6 +113,7 @@ impl TemplateConfig {
             AgentKind::Codex => (&self.codex_marketplaces, &self.codex_plugins),
             AgentKind::Grok => (&self.grok_marketplaces, &self.grok_plugins),
             AgentKind::Omp => (&self.omp_marketplaces, &self.omp_plugins),
+            AgentKind::Pi => (&[], &self.pi_packages),
         }
     }
 
@@ -121,6 +124,12 @@ impl TemplateConfig {
             AgentKind::Codex => (&mut self.codex_marketplaces, &mut self.codex_plugins),
             AgentKind::Grok => (&mut self.grok_marketplaces, &mut self.grok_plugins),
             AgentKind::Omp => (&mut self.omp_marketplaces, &mut self.omp_plugins),
+            // pi has no marketplaces (see `AgentKind::configured_plugins`), so
+            // only its packages are recorded.
+            AgentKind::Pi => {
+                self.pi_packages = lists.1;
+                return;
+            }
         };
         (*marketplaces, *plugins) = lists;
     }
@@ -667,6 +676,7 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         grok_plugins: Vec::new(),
         omp_marketplaces: Vec::new(),
         omp_plugins: Vec::new(),
+        pi_packages: Vec::new(),
         guest_user: opts.guest_user.clone(),
         oci_features: installed_features(&opts.oci_features),
     };
@@ -767,7 +777,9 @@ fn build_template(
         "    3. Create a {} GiB ext4 template image",
         cfg.vm.template_size_gib
     );
-    eprintln!("    4. Install Docker, Claude Code, Codex, Grok Build, omp, and profile packages");
+    eprintln!(
+        "    4. Install Docker, Claude Code, Codex, Grok Build, omp, pi, and profile packages"
+    );
     eprintln!("  Image: {image}");
     eprintln!("  Output: {}", cfg.template_path_for(image).display());
     eprintln!();
@@ -1514,7 +1526,7 @@ fn install_guest_packages(
     guest_user: &GuestUser,
     builder_timeout: Option<Duration>,
 ) -> Result<()> {
-    eprintln!("  Installing guest packages (Docker, Claude Code, Codex, Grok Build, omp)...");
+    eprintln!("  Installing guest packages (Docker, Claude Code, Codex, Grok Build, omp, pi)...");
     eprintln!("  This requires sudo and may take several minutes.");
 
     let template_str = image_path.display().to_string();
@@ -1848,6 +1860,10 @@ mod tests {
             script.contains("echo '  [guest] Installing omp...'"),
             "base recipe should install omp",
         );
+        assert!(
+            script.contains("echo '  [guest] Installing pi...'"),
+            "base recipe should install pi",
+        );
         no_consecutive_concat(&script);
     }
 
@@ -1897,6 +1913,7 @@ mod tests {
         assert!(tc.grok_plugins.is_empty());
         assert!(tc.omp_marketplaces.is_empty());
         assert!(tc.omp_plugins.is_empty());
+        assert!(tc.pi_packages.is_empty());
     }
 
     #[test]
@@ -1942,6 +1959,14 @@ mod tests {
                 "{agent:?}"
             );
         }
+
+        tc.set_baked(AgentKind::Pi, (Vec::new(), vec!["npm:pi-pkg".to_string()]));
+        let saved = serde_json::to_value(&tc).unwrap();
+        assert_eq!(saved["pi_packages"], serde_json::json!(["npm:pi-pkg"]));
+        assert_eq!(
+            tc.baked(AgentKind::Pi),
+            (&[][..], &["npm:pi-pkg".to_string()][..])
+        );
     }
 
     #[test]

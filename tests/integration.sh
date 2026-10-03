@@ -1485,6 +1485,167 @@ CFGEOF
     coop_exec sh -c 'rm -f ~/.omp/agent/agent.db ~/.omp/agent/mcp.json' || true
 }
 
+test_pi_bin_path() {
+    echo ""
+    echo "=== Phase: pi binary path ==="
+
+    local pi_bin=/home/ubuntu/.local/bin/pi
+    if guest_exec test -x "$pi_bin"; then
+        pass "pi binary exists at PI_BIN path"
+    else
+        skip "pi binary at PI_BIN path" "not installed in this image"
+        return
+    fi
+
+    local ver
+    if ver=$(coop_exec "$pi_bin" --version) && [[ "$ver" =~ [0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        pass "pi binary reports its version via full path ($ver)"
+    else
+        fail "pi binary reports its version via full path" \
+            "got: $ver stderr: $(guest_stderr)"
+    fi
+
+    # shellcheck disable=SC2016 # Evaluated by node in the guest.
+    if coop_exec node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 22 || (a === 22 && b >= 19) ? 0 : 1)'; then
+        pass "guest Node.js satisfies pi (>= 22.19)"
+    else
+        fail "guest Node.js satisfies pi (>= 22.19)" "stderr: $(guest_stderr)"
+    fi
+
+    local link_target
+    if link_target=$(guest_exec readlink /usr/local/bin/pi); then
+        if [[ "$link_target" == "$pi_bin" ]]; then
+            pass "pi symlink in /usr/local/bin"
+        else
+            fail "pi symlink in /usr/local/bin" "points to: $link_target"
+        fi
+    else
+        fail "pi symlink in /usr/local/bin" "not found"
+    fi
+
+    local yolo_content
+    if yolo_content=$(guest_exec cat /usr/local/bin/pi-yolo); then
+        if echo "$yolo_content" | grep -q -- "exec pi --approve" \
+            && echo "$yolo_content" | grep -q "install |"; then
+            pass "pi-yolo approves sessions and leaves subcommands first"
+        else
+            fail "pi-yolo approves sessions and leaves subcommands first" "content: $yolo_content"
+        fi
+    else
+        fail "pi-yolo approves sessions and leaves subcommands first" "stderr: $(guest_stderr)"
+    fi
+
+    if coop_exec /usr/local/bin/pi-yolo list >/dev/null; then
+        pass "pi-yolo runs a subcommand"
+    else
+        fail "pi-yolo runs a subcommand" "stderr: $(guest_stderr)"
+    fi
+}
+
+test_pi_config_merge() {
+    echo ""
+    echo "=== Phase: pi config copy and settings/mcp merge across restart ==="
+
+    # Use a fixture host dir, not the developer's ~/.pi/agent (the suite
+    # config disables that copy). Placeholder credentials are removed again
+    # at the end of the phase.
+    local pi_src="$tmpdir/pi-host-config"
+    mkdir -p "$pi_src/skills"
+    printf '%s\n' 'from-host' >"$pi_src/AGENTS.md"
+    printf '%s\n' 'from-host' >"$pi_src/skills/host.md"
+    printf '%s\n' '{"anthropic": {"type": "api_key", "key": "placeholder"}}' >"$pi_src/auth.json"
+    printf '%s\n' '{"/Users/me/project": true}' >"$pi_src/trust.json"
+    printf '%s\n' '{"theme": "light", "packages": ["./host-only-package"]}' >"$pi_src/settings.json"
+    cat >"$pi_src/mcp.json" <<'MCPEOF'
+{"mcpServers": {"host-server": {"command": "host-cmd"}, "shared": {"command": "host"}}}
+MCPEOF
+
+    local cfg_file="$tmpdir/pi-merge-coop.toml"
+    cat >"$cfg_file" <<CFGEOF
+[grok]
+config_dir = false
+
+[omp]
+config_dir = false
+
+[pi]
+config_dir = "$pi_src"
+
+[pi.mcp_servers.coop-server]
+command = "coop-cmd"
+env = { TOKEN = "COOP_TEST_PI_HOST" }
+CFGEOF
+
+    local seed='mkdir -p ~/.pi/agent/skills && printf "%s\n" '
+    seed+="'{\"mcpServers\": {\"guest-server\": {\"command\": \"guest-cmd\"}, \"shared\": {\"command\": \"guest\"}}}' "
+    seed+='> ~/.pi/agent/mcp.json && printf "%s\n" '
+    seed+="'{\"theme\": \"dark\", \"packages\": [\"npm:guest-installed\"]}' "
+    seed+='> ~/.pi/agent/settings.json && printf "%s\n" guest-only > ~/.pi/agent/skills/guest-only.md'
+    if coop_exec sh -c "$seed"; then
+        pass "seed guest pi config"
+    else
+        fail "seed guest pi config" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    coop stop "$INSTANCE" || true
+    if coop --config "$cfg_file" start "$INSTANCE"; then
+        pass "restart for pi config merge exits 0"
+    else
+        fail "restart for pi config merge exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+
+    if [[ "$(coop_exec sh -c 'cat ~/.pi/agent/AGENTS.md')" == "from-host" ]]; then
+        pass "host pi AGENTS.md copied"
+    else
+        fail "host pi AGENTS.md copied" "stderr: $(guest_stderr)"
+    fi
+
+    if coop_exec sh -c 'test -f ~/.pi/agent/skills/host.md && test -f ~/.pi/agent/skills/guest-only.md'; then
+        pass "host pi skills copied and guest-only skills kept"
+    else
+        fail "host pi skills copied and guest-only skills kept" "stderr: $(guest_stderr)"
+    fi
+
+    if coop_exec sh -c 'test ! -e ~/.pi/agent/trust.json'; then
+        pass "pi trust.json stays on the host"
+    else
+        fail "pi trust.json stays on the host" "trust.json was copied"
+    fi
+
+    local mode
+    if mode=$(coop_exec sh -c 'stat -c %a ~/.pi/agent/auth.json') && [[ "$mode" == "600" ]]; then
+        pass "pi auth.json copied as owner-only"
+    else
+        fail "pi auth.json copied as owner-only" "mode: $mode stderr: $(guest_stderr)"
+    fi
+
+    local settings
+    if settings=$(coop_exec sh -c 'jq -c . ~/.pi/agent/settings.json') \
+        && echo "$settings" | jq -e '.theme == "light" and .packages == ["npm:guest-installed"]' >/dev/null; then
+        pass "pi settings.json overlays host keys and keeps guest packages"
+    else
+        fail "pi settings.json overlays host keys and keeps guest packages" "got: $settings"
+    fi
+
+    local mcp
+    if mcp=$(coop_exec sh -c 'jq -c . ~/.pi/agent/mcp.json') \
+        && echo "$mcp" | jq -e '
+            .mcpServers["guest-server"].command == "guest-cmd"
+            and .mcpServers.shared.command == "host"
+            and .mcpServers["host-server"].command == "host-cmd"
+            and .mcpServers["coop-server"].command == "coop-cmd"
+            and .mcpServers["coop-server"].env.TOKEN == "${COOP_TEST_PI_HOST}"
+        ' >/dev/null; then
+        pass "pi mcp.json merges guest, host, then coop servers"
+    else
+        fail "pi mcp.json merges guest, host, then coop servers" "got: $mcp"
+    fi
+
+    coop_exec sh -c 'rm -f ~/.pi/agent/auth.json ~/.pi/agent/settings.json ~/.pi/agent/mcp.json' || true
+}
+
 test_claude_settings_merge() {
     echo ""
     echo "=== Phase: claude settings merge across restart ==="
@@ -1995,7 +2156,8 @@ test_agent_update() {
         if echo "$HARNESS_OUT" | grep -q "Claude Code" \
             && echo "$HARNESS_OUT" | grep -q "Codex" \
             && echo "$HARNESS_OUT" | grep -q "Grok Build" \
-            && echo "$HARNESS_OUT" | grep -q "^omp "; then
+            && echo "$HARNESS_OUT" | grep -q "^omp " \
+            && echo "$HARNESS_OUT" | grep -q "^pi "; then
             pass "agent update --check reports all agents"
         else
             fail "agent update --check reports all agents" "out: $HARNESS_OUT"
@@ -2004,6 +2166,11 @@ test_agent_update() {
             pass "agent update --check reads the installed omp version"
         else
             fail "agent update --check reads the installed omp version" "out: $HARNESS_OUT"
+        fi
+        if echo "$HARNESS_OUT" | grep -Eq '^pi +[0-9]+\.[0-9]+\.[0-9]+'; then
+            pass "agent update --check reads the installed pi version"
+        else
+            fail "agent update --check reads the installed pi version" "out: $HARNESS_OUT"
         fi
     else
         fail "agent update --check exits 0" "exit: $? stderr: $HARNESS_ERR"
@@ -7491,9 +7658,9 @@ main() {
 
     tmpdir=$(mktemp -d)
 
-    # Isolate the suite from the developer's ~/.grok and ~/.omp/agent. A real
-    # host tree can hold gigabytes of skills, venvs, and git lore, and omp's
-    # holds real credentials; Linux CI usually has neither, so the same suite
+    # Isolate the suite from the developer's ~/.grok, ~/.omp/agent, and
+    # ~/.pi/agent. A real host tree can hold gigabytes of skills, venvs, and git
+    # lore, and the omp and pi trees hold real credentials; Linux CI usually has neither, so the same suite
     # would pass there and fail here. Phases that need a host copy pass their
     # own --config with a fixture directory.
     SUITE_CONFIG="$tmpdir/suite-config.toml"
@@ -7502,6 +7669,9 @@ main() {
 config_dir = false
 
 [omp]
+config_dir = false
+
+[pi]
 config_dir = false
 EOF
 
@@ -7536,6 +7706,8 @@ EOF
     test_grok_settings_merge
     test_omp_bin_path
     test_omp_config_merge
+    test_pi_bin_path
+    test_pi_config_merge
     test_claude_settings_merge
     test_claude_onboarding_seed
     test_codex_bin_path

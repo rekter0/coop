@@ -1031,6 +1031,7 @@ fn build_golden_image(
         grok_plugins: Vec::new(),
         omp_marketplaces: Vec::new(),
         omp_plugins: Vec::new(),
+        pi_packages: Vec::new(),
         guest_user: guest_user.clone(),
         oci_features: installed_features(oci_features),
     };
@@ -2728,6 +2729,10 @@ mod tests {
         assert!(
             script.contains("echo '  [guest] Installing omp...'"),
             "Lima provision script should install omp",
+        );
+        assert!(
+            script.contains("echo '  [guest] Installing pi...'"),
+            "Lima provision script should install pi",
         );
     }
 

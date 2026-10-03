@@ -34,6 +34,21 @@
   `--check` compares omp against its latest GitHub release. Existing images
   need `coop setup --rebuild`; existing VMs also need
   `coop restore <vm> --image <image> --reprovision` (or destroy/recreate).
+- **pi** — `coop pi` launches [pi](https://github.com/earendil-works/pi)
+  inside the guest with `--approve`, which trusts the project's `.pi/` files
+  (pi has no per-tool prompts); `--ask` keeps pi's project-trust prompt, and
+  pi subcommands are passed through unprefixed. The golden image installs
+  Node.js 22 from NodeSource and `@earendil-works/pi-coding-agent` from npm
+  under the guest user's `~/.local` (`--ignore-scripts`), plus a `pi-yolo`
+  shortcut. `[pi]` copies an allowlist from `config_dir` (default
+  `~/.pi/agent`), including `auth.json` (set to `0600`), overlays host
+  `settings.json` while keeping the guest `packages` list, merges host
+  `mcp.json` and `[pi.mcp_servers]` into the guest `mcp.json` (SSE servers are
+  rejected), forwards `env_forward` provider keys, and installs `packages`
+  (`npm:`/`git:` sources) on first boot. `coop agent update --pi` runs
+  `pi update`, and `--check` compares pi against its latest GitHub release.
+  Existing images need `coop setup --rebuild`; existing VMs also need
+  `coop restore <vm> --image <image> --reprovision` (or destroy/recreate).
 
 ## v0.6.0
 

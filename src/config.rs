@@ -730,6 +730,10 @@ pub struct CoopConfig {
     #[serde(default)]
     pub omp: OmpConfig,
 
+    /// pi config forwarding settings
+    #[serde(default)]
+    pub pi: PiConfig,
+
     /// Host-side credential-injecting proxy (issue #411). Opt-in: when an
     /// upstream is configured, the real credential stays on the host and the
     /// guest is pointed at a local proxy instead of receiving the key.
@@ -1611,6 +1615,64 @@ pub struct OmpConfig {
     pub config_dir: ConfigDir,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct PiConfig {
+    /// Additional env var names to forward from host to guest via SSH.
+    /// pi reads provider keys from the environment; `ANTHROPIC_API_KEY`,
+    /// `OPENAI_API_KEY`, and `XAI_API_KEY` are already forwarded.
+    #[serde(default)]
+    pub env_forward: Vec<EnvVarName>,
+
+    /// pi packages to install in the guest (`npm:<spec>`, `git:<repo>`, or a
+    /// git URL). Validated by [`check_pi_package_sources`].
+    #[serde(default)]
+    pub packages: Vec<String>,
+
+    /// MCP servers to merge into the guest `~/.pi/agent/mcp.json`
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, McpServerDef>,
+
+    /// Source directory for pi files copied into the guest `~/.pi/agent/`
+    /// (instructions, `models.json`, `keybindings.json`, the `auth.json`
+    /// credential store, and extension/skill/prompt/theme directories). Host
+    /// `settings.json` and `mcp.json` are merged, not copied over.
+    #[serde(default)]
+    pub config_dir: ConfigDir,
+}
+
+/// pi package sources a guest can install: npm specs, git sources, and git
+/// URLs. A local path refers to the host, so it is rejected.
+fn check_pi_package_sources(packages: &[String], errors: &mut Vec<String>) {
+    for source in packages {
+        let supported = ["npm:", "git:", "https://", "http://", "ssh://", "git@"]
+            .iter()
+            .any(|prefix| source.starts_with(prefix));
+        if !supported {
+            errors.push(format!(
+                "pi.packages entry '{source}' is not an npm or git source; \
+                 use npm:<package>, git:<host>/<repo>, or a git URL"
+            ));
+        }
+    }
+}
+
+/// pi supports stdio and streamable-HTTP MCP servers but rejects the legacy
+/// SSE transport.
+fn check_pi_mcp_transports(servers: &HashMap<String, McpServerDef>, errors: &mut Vec<String>) {
+    let mut sse: Vec<&str> = servers
+        .iter()
+        .filter(|(_, def)| matches!(def, McpServerDef::Sse { .. }))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    sse.sort_unstable();
+    for name in sse {
+        errors.push(format!(
+            "pi.mcp_servers.{name} uses type = \"sse\", which pi does not support; \
+             use type = \"http\""
+        ));
+    }
+}
+
 /// Codex cloud authentication mode.
 ///
 /// `ApiKey` preserves the historical behavior: coop forwards
@@ -2173,6 +2235,15 @@ impl CoopConfig {
             ));
         }
 
+        if let ConfigDir::Custom(ref path) = self.pi.config_dir
+            && !path.is_dir()
+        {
+            errors.push(format!(
+                "pi.config_dir '{}' does not exist or is not a directory",
+                path.display()
+            ));
+        }
+
         if self.codex.auth.uses_chatgpt_account() && self.proxy.openai.is_some() {
             errors.push(
                 "codex.auth = \"chatgpt\" conflicts with [proxy.openai]; \
@@ -2190,6 +2261,8 @@ impl CoopConfig {
         check_local_marketplaces("codex.marketplaces", &self.codex.marketplaces, &mut errors);
         check_local_marketplaces("grok.marketplaces", &self.grok.marketplaces, &mut errors);
         check_local_marketplaces("omp.marketplaces", &self.omp.marketplaces, &mut errors);
+        check_pi_package_sources(&self.pi.packages, &mut errors);
+        check_pi_mcp_transports(&self.pi.mcp_servers, &mut errors);
 
         // `[claude.local_model]` / `[codex.local_model]` invariants
         // (http(s) scheme, present host, non-empty model) are enforced by
@@ -2511,6 +2584,7 @@ impl Default for CoopConfig {
             codex: CodexConfig::default(),
             grok: GrokConfig::default(),
             omp: OmpConfig::default(),
+            pi: PiConfig::default(),
             proxy: ProxyConfig::default(),
             guest_env: BTreeMap::new(),
             profiles: HashMap::new(),
@@ -5781,6 +5855,73 @@ skip = ["not-a-slug"]
         let tmp = TempDir::new().unwrap();
         let mut cfg = CoopConfig::default();
         cfg.omp.config_dir = ConfigDir::Custom(ConfigPath::new(tmp.path()));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_nonexistent_pi_config_dir() {
+        let mut cfg = CoopConfig::default();
+        cfg.pi.config_dir = ConfigDir::Custom(ConfigPath::new("/nonexistent/config"));
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("pi.config_dir"),
+            "expected pi config_dir error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_passes_with_existing_pi_config_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = CoopConfig::default();
+        cfg.pi.config_dir = ConfigDir::Custom(ConfigPath::new(tmp.path()));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_npm_and_git_pi_packages() {
+        let mut cfg = CoopConfig::default();
+        cfg.pi.packages = vec![
+            "npm:@example/pi-tools@1.0.0".into(),
+            "git:github.com/example/pi-tools@v1".into(),
+            "https://github.com/example/pi-tools".into(),
+            "ssh://git@github.com/example/pi-tools".into(),
+            "git@github.com:example/pi-tools".into(),
+        ];
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_local_pi_packages() {
+        for source in ["./pi-tools", "/Users/me/pi-tools", "pi-tools"] {
+            let mut cfg = CoopConfig::default();
+            cfg.pi.packages = vec![source.into()];
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("pi.packages"), "{source}: {err}");
+            assert!(err.contains(source), "{source}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_sse_pi_mcp_servers() {
+        let mut cfg = CoopConfig::default();
+        let url = url::Url::parse("https://example.com/sse").unwrap();
+        cfg.pi.mcp_servers.insert(
+            "events".into(),
+            McpServerDef::Sse {
+                url: url.clone(),
+                headers: HashMap::new(),
+            },
+        );
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("pi.mcp_servers.events"), "{err}");
+
+        cfg.pi.mcp_servers.insert(
+            "events".into(),
+            McpServerDef::Http {
+                url,
+                headers: HashMap::new(),
+            },
+        );
         assert!(cfg.validate().is_ok());
     }
 

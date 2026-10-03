@@ -1,10 +1,10 @@
 # coop
 
-Isolated VM environments for running Claude Code, Codex, Grok Build, and omp.
+Isolated VM environments for running Claude Code, Codex, Grok Build, omp, and pi.
 
 > **Pronunciation:** "coop" (/kuːp/) — one syllable, rhymes with "loop", like the thing you keep chickens in. Not "co-op".
 
-coop is a Rust CLI that manages disposable virtual machines where Claude Code, Codex, Grok Build, and omp have full tool access: Docker, git, compilers, package managers, all without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy.
+coop is a Rust CLI that manages disposable virtual machines where Claude Code, Codex, Grok Build, omp, and pi have full tool access: Docker, git, compilers, package managers, all without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy.
 
 ## Setup
 
@@ -56,6 +56,8 @@ coop codex
 coop grok
 # or
 coop omp
+# or
+coop pi
 ```
 
 ## Documentation
@@ -70,6 +72,7 @@ coop omp
 - [Codex integration](docs/codex-integration.md)
 - [Grok Build integration](docs/grok-integration.md)
 - [omp integration](docs/omp-integration.md)
+- [pi integration](docs/pi-integration.md)
 - [Editor integration](docs/editor.md)
 - [Multi-instance](docs/multi-instance.md)
 - [Platform backends](docs/backends.md)

@@ -19,13 +19,14 @@ pub enum AgentKind {
     Codex,
     Grok,
     Omp,
+    Pi,
 }
 
 impl AgentKind {
     /// Every agent, in install, bootstrap, and update order. The install
     /// order is part of the provisioning script, whose hash decides whether
     /// an existing golden image is stale.
-    pub const ALL: [Self; 4] = [Self::Claude, Self::Codex, Self::Grok, Self::Omp];
+    pub const ALL: [Self; 5] = [Self::Claude, Self::Codex, Self::Grok, Self::Omp, Self::Pi];
 
     /// Human-facing label used in prompts, reports, and errors.
     pub fn display(self) -> &'static str {
@@ -34,6 +35,7 @@ impl AgentKind {
             Self::Codex => "Codex",
             Self::Grok => "Grok Build",
             Self::Omp => "omp",
+            Self::Pi => "pi",
         }
     }
 
@@ -45,11 +47,12 @@ impl AgentKind {
             Self::Codex => "codex",
             Self::Grok => "grok",
             Self::Omp => "omp",
+            Self::Pi => "pi",
         }
     }
 
     /// Absolute guest path coop invokes for this agent. Claude Code, Grok
-    /// Build, and omp live under the guest user's home; Codex uses its
+    /// Build, omp, and pi live under the guest user's home; Codex uses its
     /// system compatibility link.
     pub fn binary(self, user: &GuestUser) -> GuestPath {
         match self {
@@ -57,6 +60,7 @@ impl AgentKind {
             Self::Codex => guest::codex_bin(),
             Self::Grok => user.grok_bin(),
             Self::Omp => user.omp_bin(),
+            Self::Pi => user.pi_bin(),
         }
     }
 
@@ -72,6 +76,7 @@ impl AgentKind {
             Self::Codex => &[guest::SCRIPT_CODEX, guest::SCRIPT_CODEX_ACCOUNT],
             Self::Grok => &[guest::SCRIPT_GROK],
             Self::Omp => &[guest::SCRIPT_OMP],
+            Self::Pi => &[guest::SCRIPT_PI],
         }
     }
 
@@ -79,6 +84,9 @@ impl AgentKind {
     pub fn required_binaries(self, user: &GuestUser) -> Vec<GuestPath> {
         match self {
             Self::Claude | Self::Grok | Self::Omp => vec![self.binary(user)],
+            // pi's entry point is a Node script, so the runtime is part of the
+            // install.
+            Self::Pi => vec![self.binary(user), GuestPath::new("/usr/bin/node")],
             Self::Codex => vec![
                 guest::codex_bin(),
                 guest::codex_code_mode_host_bin(),
@@ -95,9 +103,9 @@ impl AgentKind {
     }
 
     /// Host environment variable names forwarded into the guest for this
-    /// agent: its `env_forward` list, plus the host names that Grok and omp
-    /// stdio MCP `env` mappings reference (both expand them as `${NAME}` in
-    /// the guest config, so they must exist there).
+    /// agent: its `env_forward` list, plus the host names that Grok, omp,
+    /// and pi stdio MCP `env` mappings reference (they expand them as
+    /// `${NAME}` in the guest config, so they must exist there).
     pub fn env_forward_names(self, cfg: &CoopConfig) -> Vec<EnvVarName> {
         match self {
             Self::Claude => cfg.claude.env_forward.clone(),
@@ -112,6 +120,11 @@ impl AgentKind {
                 names.extend(mcp_stdio_env_host_names(&cfg.omp.mcp_servers));
                 names
             }
+            Self::Pi => {
+                let mut names = cfg.pi.env_forward.clone();
+                names.extend(mcp_stdio_env_host_names(&cfg.pi.mcp_servers));
+                names
+            }
         }
     }
 
@@ -123,6 +136,8 @@ impl AgentKind {
             Self::Codex => (&cfg.codex.marketplaces, &cfg.codex.plugins),
             Self::Grok => (&cfg.grok.marketplaces, &cfg.grok.plugins),
             Self::Omp => (&cfg.omp.marketplaces, &cfg.omp.plugins),
+            // pi has no marketplaces; its packages are installed directly.
+            Self::Pi => (&[], &cfg.pi.packages),
         }
     }
 
@@ -145,7 +160,7 @@ impl AgentKind {
                     plugins.extend(def.plugins.iter().cloned());
                 }
             }
-            Self::Codex | Self::Grok | Self::Omp => {}
+            Self::Codex | Self::Grok | Self::Omp | Self::Pi => {}
         }
 
         marketplaces.sort_unstable();
@@ -179,12 +194,13 @@ mod tests {
         assert_eq!(AgentKind::Codex.display(), "Codex");
         assert_eq!(AgentKind::Grok.display(), "Grok Build");
         assert_eq!(AgentKind::Omp.display(), "omp");
+        assert_eq!(AgentKind::Pi.display(), "pi");
     }
 
     #[test]
     fn cli_name_matches_each_subcommand() {
         let names: Vec<&str> = AgentKind::ALL.iter().map(|a| a.cli_name()).collect();
-        assert_eq!(names, ["claude", "codex", "grok", "omp"]);
+        assert_eq!(names, ["claude", "codex", "grok", "omp", "pi"]);
     }
 
     #[test]
@@ -206,6 +222,10 @@ mod tests {
             AgentKind::Omp.binary(&user).to_string(),
             "/home/dev/.local/bin/omp"
         );
+        assert_eq!(
+            AgentKind::Pi.binary(&user).to_string(),
+            "/home/dev/.local/bin/pi"
+        );
     }
 
     #[test]
@@ -225,6 +245,7 @@ mod tests {
                 guest::SCRIPT_CODEX_ACCOUNT,
                 guest::SCRIPT_GROK,
                 guest::SCRIPT_OMP,
+                guest::SCRIPT_PI,
             ]
         );
     }
@@ -242,6 +263,10 @@ mod tests {
         assert_eq!(paths(AgentKind::Claude), ["/home/ubuntu/.local/bin/claude"]);
         assert_eq!(paths(AgentKind::Grok), ["/home/ubuntu/.grok/bin/grok"]);
         assert_eq!(paths(AgentKind::Omp), ["/home/ubuntu/.local/bin/omp"]);
+        assert_eq!(
+            paths(AgentKind::Pi),
+            ["/home/ubuntu/.local/bin/pi", "/usr/bin/node"]
+        );
         assert_eq!(
             paths(AgentKind::Codex),
             [
@@ -262,6 +287,7 @@ mod tests {
         cfg.codex.env_forward = vec![EnvVarName::new("CODEX_ONLY").unwrap()];
         cfg.grok.env_forward = vec![EnvVarName::new("GROK_ONLY").unwrap()];
         cfg.omp.env_forward = vec![EnvVarName::new("OMP_ONLY").unwrap()];
+        cfg.pi.env_forward = vec![EnvVarName::new("PI_ONLY").unwrap()];
         let mut env = std::collections::BTreeMap::new();
         env.insert(
             EnvVarName::new("TOKEN").unwrap(),
@@ -288,6 +314,19 @@ mod tests {
                 env: omp_env,
             },
         );
+        let mut pi_env = std::collections::BTreeMap::new();
+        pi_env.insert(
+            EnvVarName::new("TOKEN").unwrap(),
+            EnvVarName::new("PI_MCP_HOST").unwrap(),
+        );
+        cfg.pi.mcp_servers.insert(
+            "tool".into(),
+            crate::config::McpServerDef::Stdio {
+                command: "npx".into(),
+                args: vec![],
+                env: pi_env,
+            },
+        );
 
         let names = |agent: AgentKind| -> Vec<String> {
             agent
@@ -300,6 +339,7 @@ mod tests {
         assert_eq!(names(AgentKind::Codex), ["CODEX_ONLY"]);
         assert_eq!(names(AgentKind::Grok), ["GROK_ONLY", "GROK_MCP_HOST"]);
         assert_eq!(names(AgentKind::Omp), ["OMP_ONLY", "OMP_MCP_HOST"]);
+        assert_eq!(names(AgentKind::Pi), ["PI_ONLY", "PI_MCP_HOST"]);
     }
 
     #[test]
@@ -325,6 +365,11 @@ mod tests {
             assert_eq!(marketplaces, [marketplace], "{agent:?}");
             assert_eq!(plugins, [plugin], "{agent:?}");
         }
+
+        cfg.pi.packages = vec!["npm:pi-p".into()];
+        let (marketplaces, packages) = AgentKind::Pi.configured_plugins(&cfg);
+        assert!(marketplaces.is_empty());
+        assert_eq!(packages, ["npm:pi-p"]);
     }
 
     #[test]
@@ -350,6 +395,7 @@ mod tests {
         cfg.grok.plugins = vec!["p4@d".into(), "p3@c".into(), "p4@d".into()];
         cfg.omp.marketplaces = vec!["f".into(), "e".into(), "e".into()];
         cfg.omp.plugins = vec!["p6@f".into(), "p5@e".into(), "p6@f".into()];
+        cfg.pi.packages = vec!["npm:b".into(), "npm:a".into(), "npm:b".into()];
         let profiles = [profile(&["profile-m"], &["profile-p"])];
 
         let (marketplaces, plugins) = AgentKind::Codex.baked_lists(&cfg, &profiles);
@@ -363,5 +409,9 @@ mod tests {
         let (marketplaces, plugins) = AgentKind::Omp.baked_lists(&cfg, &profiles);
         assert_eq!(marketplaces, ["e", "f"]);
         assert_eq!(plugins, ["p5@e", "p6@f"]);
+
+        let (marketplaces, packages) = AgentKind::Pi.baked_lists(&cfg, &profiles);
+        assert!(marketplaces.is_empty());
+        assert_eq!(packages, ["npm:a", "npm:b"]);
     }
 }

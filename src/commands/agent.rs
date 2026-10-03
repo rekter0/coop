@@ -25,6 +25,10 @@
 //!   updates at startup. `coop agent update --omp` runs `omp update`, which
 //!   downloads and checksums the release binary, as the guest user; `--check`
 //!   compares against the latest GitHub release like Codex.
+//! - **pi** is an npm package under the guest user's `~/.local` prefix.
+//!   `coop agent update --pi` runs `pi update`, which reinstalls it with npm
+//!   into that prefix as the guest user; `--check` compares against the
+//!   latest GitHub release.
 
 use std::io::Write as _;
 
@@ -50,6 +54,7 @@ pub(crate) struct AgentUpdateOpts {
 /// do not update themselves in the background.
 const CODEX_REPO: &str = "openai/codex";
 const OMP_REPO: &str = "can1357/oh-my-pi";
+const PI_REPO: &str = "earendil-works/pi";
 
 // ── Domain types ──────────────────────────────────────────────
 
@@ -58,7 +63,9 @@ const OMP_REPO: &str = "can1357/oh-my-pi";
 /// self-update as root or Codex's reinstall without sudo.
 fn strategy(agent: AgentKind) -> UpdateStrategy {
     match agent {
-        AgentKind::Claude | AgentKind::Grok | AgentKind::Omp => UpdateStrategy::SelfUpdate,
+        AgentKind::Claude | AgentKind::Grok | AgentKind::Omp | AgentKind::Pi => {
+            UpdateStrategy::SelfUpdate
+        }
         AgentKind::Codex => UpdateStrategy::ReinstallAsRoot {
             script: guest::SCRIPT_CODEX,
         },
@@ -70,7 +77,7 @@ fn strategy(agent: AgentKind) -> UpdateStrategy {
 fn auto_updates(agent: AgentKind) -> bool {
     match agent {
         AgentKind::Claude | AgentKind::Grok => true,
-        AgentKind::Codex | AgentKind::Omp => false,
+        AgentKind::Codex | AgentKind::Omp | AgentKind::Pi => false,
     }
 }
 
@@ -354,6 +361,7 @@ fn release_repo(agent: AgentKind) -> Option<&'static str> {
         AgentKind::Claude | AgentKind::Grok => None,
         AgentKind::Codex => Some(CODEX_REPO),
         AgentKind::Omp => Some(OMP_REPO),
+        AgentKind::Pi => Some(PI_REPO),
     }
 }
 
@@ -475,7 +483,7 @@ mod tests {
 
     #[test]
     fn selection_keeps_named_agents_in_canonical_order() {
-        use AgentKind::{Claude, Codex, Grok, Omp};
+        use AgentKind::{Claude, Codex, Grok, Omp, Pi};
         assert_eq!(select(&[Claude]).agents(), &[Claude]);
         assert_eq!(select(&[Codex]).agents(), &[Codex]);
         assert_eq!(select(&[Grok]).agents(), &[Grok]);
@@ -483,8 +491,9 @@ mod tests {
         assert_eq!(select(&[Claude, Grok]).agents(), &[Claude, Grok]);
         assert_eq!(select(&[Grok, Codex]).agents(), &[Codex, Grok]);
         assert_eq!(select(&[Omp, Codex]).agents(), &[Codex, Omp]);
+        assert_eq!(select(&[Pi, Omp]).agents(), &[Omp, Pi]);
         assert_eq!(
-            select(&[Omp, Grok, Claude, Codex]).agents(),
+            select(&[Pi, Omp, Grok, Claude, Codex]).agents(),
             &AgentKind::ALL
         );
     }
@@ -515,7 +524,7 @@ mod tests {
         );
         assert_eq!(
             selection_phrase(&select(&[])),
-            "Claude Code, Codex, Grok Build, and omp"
+            "Claude Code, Codex, Grok Build, omp, and pi"
         );
     }
 
@@ -630,6 +639,7 @@ mod tests {
     fn release_repo_names_only_agents_without_background_updates() {
         assert_eq!(release_repo(AgentKind::Codex), Some("openai/codex"));
         assert_eq!(release_repo(AgentKind::Omp), Some("can1357/oh-my-pi"));
+        assert_eq!(release_repo(AgentKind::Pi), Some("earendil-works/pi"));
         assert_eq!(release_repo(AgentKind::Claude), None);
         assert_eq!(release_repo(AgentKind::Grok), None);
     }
@@ -795,6 +805,10 @@ mod tests {
         ));
         assert!(matches!(
             strategy(AgentKind::Omp),
+            UpdateStrategy::SelfUpdate
+        ));
+        assert!(matches!(
+            strategy(AgentKind::Pi),
             UpdateStrategy::SelfUpdate
         ));
     }

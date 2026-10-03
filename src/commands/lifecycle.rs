@@ -1541,6 +1541,10 @@ pub(crate) fn cmd_agent_launch(
             agent.binary(&guest::GuestUser::new(sess.target.user.as_ref())?),
             omp_launch_args(ask, args),
         ),
+        AgentKind::Pi => (
+            agent.binary(&guest::GuestUser::new(sess.target.user.as_ref())?),
+            pi_launch_args(ask, args),
+        ),
     };
     ssh::run_interactive(&sess, &prepend_binary(bin.as_ref(), args))
 }
@@ -1648,6 +1652,34 @@ pub(crate) fn omp_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String> {
         args.insert(0, OMP_APPROVAL_MODE.to_string());
     } else {
         args.insert(0, OMP_YOLO.to_string());
+    }
+    args
+}
+
+/// pi subcommands. pi recognizes them only as the first argument, so a
+/// launch flag must not be placed in front of them.
+const PI_SUBCOMMANDS: &[&str] = &[
+    "auth",
+    "install",
+    "remove",
+    "uninstall",
+    "update",
+    "list",
+    "config",
+    "mcp",
+];
+const PI_APPROVE: &str = "--approve";
+
+/// Prepend `--approve`, which trusts the project-local `.pi` resources in
+/// `/workspace` for the session, unless the user runs a pi subcommand or
+/// passes `ask`. pi has no per-tool approval prompts; its only prompt is
+/// that project-trust question, which `ask` keeps.
+pub(crate) fn pi_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String> {
+    let is_subcommand = args
+        .first()
+        .is_some_and(|arg| PI_SUBCOMMANDS.contains(&arg.as_str()));
+    if !ask && !is_subcommand {
+        args.insert(0, PI_APPROVE.to_string());
     }
     args
 }
@@ -2795,6 +2827,39 @@ mod tests {
             args,
             vec!["--permission-mode", "default", "--model", "opus"]
         );
+    }
+
+    #[test]
+    fn pi_launch_args_approve_project_files_by_default() {
+        let args = super::pi_launch_args(false, vec!["--model".into(), "opus".into()]);
+        assert_eq!(args, vec!["--approve", "--model", "opus"]);
+        assert_eq!(super::pi_launch_args(false, Vec::new()), vec!["--approve"]);
+    }
+
+    #[test]
+    fn pi_launch_args_ask_keeps_the_trust_prompt() {
+        let args = super::pi_launch_args(true, vec!["--model".into(), "opus".into()]);
+        assert_eq!(args, vec!["--model", "opus"]);
+    }
+
+    #[test]
+    fn pi_launch_args_leave_subcommands_first() {
+        for subcommand in [
+            "auth",
+            "install",
+            "remove",
+            "uninstall",
+            "update",
+            "list",
+            "config",
+            "mcp",
+        ] {
+            let args = super::pi_launch_args(false, vec![subcommand.into(), "x".into()]);
+            assert_eq!(args, vec![subcommand, "x"], "{subcommand}");
+        }
+        // A subcommand word later in the args is a prompt, not a subcommand.
+        let args = super::pi_launch_args(false, vec!["-p".into(), "install".into()]);
+        assert_eq!(args, vec!["--approve", "-p", "install"]);
     }
 
     #[test]

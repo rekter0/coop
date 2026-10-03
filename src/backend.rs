@@ -1606,6 +1606,7 @@ pub fn bootstrap_agents(
             AgentKind::Codex => bootstrap_codex(session, cfg, inst, mode, guest_host)?,
             AgentKind::Grok => bootstrap_grok(session, cfg, inst, mode)?,
             AgentKind::Omp => bootstrap_omp(session, cfg, inst, mode)?,
+            AgentKind::Pi => bootstrap_pi(session, cfg, inst, mode)?,
         }
     }
 
@@ -1943,7 +1944,7 @@ fn bootstrap_omp(
     }
 
     copy_omp_config(&session.target, &omp.config_dir)?;
-    write_managed_omp_mcp(&session.target, &omp.config_dir, &omp.mcp_servers)?;
+    write_managed_mcp_json(&session.target, &OMP_MCP, &omp.config_dir, &omp.mcp_servers)?;
 
     if let BootMode::FirstBoot = mode {
         let (missing_marketplaces, missing_plugins) =
@@ -1958,6 +1959,55 @@ fn bootstrap_omp(
     }
 
     tracing::info!("omp bootstrap complete");
+    Ok(())
+}
+
+/// Bootstrap pi in the guest declaratively.
+///
+/// Copies allowlisted host content into `~/.pi/agent/` (including the
+/// `auth.json` credential store, restricted to owner-only), merges host
+/// `settings.json` and MCP servers into the guest files, and (on first boot)
+/// installs `[pi] packages` not already baked into the golden image.
+fn bootstrap_pi(
+    session: &SshSession,
+    cfg: &CoopConfig,
+    inst: &crate::config::Instance,
+    mode: BootMode,
+) -> Result<()> {
+    let pi = &cfg.pi;
+    let pi_bin = persisted_guest_user(cfg, &inst.image).pi_bin();
+
+    if let BootMode::FirstBoot = mode
+        && !pi.packages.is_empty()
+        && !session
+            .target
+            .exec_ok(RemoteCommand::new().literal("test -x ").arg(&pi_bin))
+    {
+        bail!(
+            "pi is not installed in the guest.\n\
+             The golden image may have been built before pi support was \
+             added, or the install failed.\n\
+             Run `coop setup --rebuild` to rebuild the image."
+        );
+    }
+
+    copy_pi_config(&session.target, &pi.config_dir)?;
+    write_managed_pi_settings(&session.target, &pi.config_dir)?;
+    write_managed_mcp_json(&session.target, &PI_MCP, &pi.config_dir, &pi.mcp_servers)?;
+
+    if let BootMode::FirstBoot = mode {
+        let (missing_marketplaces, missing_packages) =
+            compute_plugin_delta(cfg, &inst.image, AgentKind::Pi);
+        install_agent_plugins(
+            session,
+            AgentKind::Pi,
+            &pi_bin,
+            &missing_marketplaces,
+            &missing_packages,
+        )?;
+    }
+
+    tracing::info!("pi bootstrap complete");
     Ok(())
 }
 
@@ -2529,12 +2579,6 @@ const OMP_ALLOWED_DIRS: &[&str] = &[
 const OMP_AGENT_DB: &str = "agent.db";
 const OMP_AGENT_DB_WAL: &str = "agent.db-wal";
 
-const OMP_MCP_READ_COMMAND: &str = concat!(
-    "test -x ~/.omp/agent || exit 1; ",
-    "if [ -e ~/.omp/agent/mcp.json ] || [ -L ~/.omp/agent/mcp.json ]; then ",
-    "cat -- ~/.omp/agent/mcp.json; fi"
-);
-
 fn copy_omp_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> {
     let Some(source_dir) = resolve_config_source_dir(config_dir, OMP_GUEST_DIR, "omp.config_dir")
     else {
@@ -2597,49 +2641,172 @@ fn restrict_guest_omp_credentials(target: &SshTarget) -> Result<()> {
         .context("Failed to restrict guest ~/.omp/agent/agent.db to owner-only")
 }
 
-/// Merge host and coop-configured MCP servers into the guest
-/// `~/.omp/agent/mcp.json`. Leaves the guest file untouched when there is
-/// nothing to merge.
-fn write_managed_omp_mcp(
-    target: &SshTarget,
-    config_dir: &ConfigDir,
-    mcp_servers: &std::collections::HashMap<String, McpServerDef>,
-) -> Result<()> {
-    let host = read_host_omp_mcp_json(config_dir)?;
-    if host.trim().is_empty() && mcp_servers.is_empty() {
+/// The guest pi agent directory, relative to the guest user's home.
+const PI_GUEST_DIR: &str = ".pi/agent";
+
+/// Top-level files copied verbatim from the host pi agent dir, including
+/// `auth.json`, pi's credential store. `settings.json` and `mcp.json` are
+/// merged instead.
+const PI_ALLOWED_FILES: &[&str] = &[
+    "AGENTS.md",
+    "AGENTS.override.md",
+    "CLAUDE.md",
+    "SYSTEM.md",
+    "APPEND_SYSTEM.md",
+    "keybindings.json",
+    "models.json",
+    "auth.json",
+];
+const PI_ALLOWED_DIRS: &[&str] = &["extensions", "skills", "prompts", "themes"];
+
+fn copy_pi_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> {
+    let Some(source_dir) = resolve_config_source_dir(config_dir, PI_GUEST_DIR, "pi.config_dir")
+    else {
         return Ok(());
+    };
+
+    let staged = stage_selected_files(
+        &source_dir,
+        PI_ALLOWED_FILES,
+        PI_ALLOWED_DIRS,
+        TreeCopy::SkipHostTrees,
+    )
+    .context("Failed to stage pi config files")?;
+    let copies_auth = staged.path().join("auth.json").is_file();
+    copy_staged_to_guest(target, &staged, PI_GUEST_DIR, "pi")?;
+    if copies_auth {
+        // `scp` without `-p` creates guest files with the remote umask.
+        target
+            .exec(RemoteCommand::new().literal("chmod 0600 ~/.pi/agent/auth.json"))
+            .context("Failed to restrict guest ~/.pi/agent/auth.json to owner-only")?;
     }
-
-    target.exec(RemoteCommand::new().literal("mkdir -p ~/.omp/agent"))?;
-    let existing = target
-        .capture(OMP_MCP_READ_COMMAND)
-        .context("Failed to read guest ~/.omp/agent/mcp.json")?;
-    let resolved = resolve_mcp_header_secrets("omp MCP server", mcp_servers)?;
-    let merged = merge_omp_mcp_json(&existing, &host, &resolved)?;
-
-    // mktemp creates the file 0600, which keeps resolved header secrets
-    // owner-only after the rename.
-    target
-        .exec_with_stdin(
-            RemoteCommand::new().literal(
-                "t=\"$(mktemp ~/.omp/agent/mcp.json.XXXXXX)\" && \
-                 cat > \"$t\" && mv \"$t\" ~/.omp/agent/mcp.json",
-            ),
-            merged.into_bytes(),
-        )
-        .context("Failed to write managed ~/.omp/agent/mcp.json")?;
     Ok(())
 }
 
-/// Read the host `mcp.json` whose servers are merged into the guest file.
-/// Missing or disabled config is empty; a present but unreadable file is
-/// an error.
-fn read_host_omp_mcp_json(config_dir: &ConfigDir) -> Result<String> {
-    let Some(source_dir) = resolve_config_source_dir(config_dir, OMP_GUEST_DIR, "omp.config_dir")
-    else {
+/// Overlay the host `settings.json` onto the guest file. Leaves the guest
+/// file untouched when the host has none.
+fn write_managed_pi_settings(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> {
+    let host = read_host_config_file(config_dir, PI_GUEST_DIR, "pi.config_dir", "settings.json")?;
+    if host.trim().is_empty() {
+        return Ok(());
+    }
+
+    target.exec(RemoteCommand::new().literal("mkdir -p ~/.pi/agent"))?;
+    let existing = target
+        .capture(&guest_file_read_command(PI_GUEST_DIR, "settings.json"))
+        .context("Failed to read guest ~/.pi/agent/settings.json")?;
+    let merged = merge_pi_settings(&existing, &host)?;
+    write_guest_file(target, PI_GUEST_DIR, "settings.json", merged)
+}
+
+/// Merge host pi settings into the guest `settings.json`.
+///
+/// The guest file is the base. Host keys overlay it; when both values are
+/// objects they merge and the host wins on a conflict, otherwise the host
+/// value replaces. The host `packages` list is dropped: it names host
+/// installs and paths, and the guest installs its own from `[pi] packages`.
+/// The guest `packages` list is kept, so packages installed in the guest
+/// stay loaded across restarts.
+fn merge_pi_settings(existing: &str, host: &str) -> Result<String> {
+    let mut root = parse_json_object(existing, "existing ~/.pi/agent/settings.json")?;
+    let mut host_root = parse_json_object(host, "host ~/.pi/agent/settings.json")?;
+    if host_root.remove("packages").is_some() {
+        tracing::warn!(
+            "Dropping `packages` from host ~/.pi/agent/settings.json; \
+             list the packages the guest should install in [pi] packages"
+        );
+    }
+    overlay_json_object(&mut root, host_root);
+
+    let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(root))
+        .context("Failed to serialize managed ~/.pi/agent/settings.json")?;
+    text.push('\n');
+    Ok(text)
+}
+
+/// Overlay `src` onto `dest`. Host wins on the same key. When both values
+/// are objects, merge them; otherwise replace.
+fn overlay_json_object(
+    dest: &mut serde_json::Map<String, serde_json::Value>,
+    src: serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, src_val) in src {
+        match (dest.get_mut(&key), src_val) {
+            (Some(serde_json::Value::Object(dest_obj)), serde_json::Value::Object(src_obj)) => {
+                overlay_json_object(dest_obj, src_obj);
+            }
+            (_, src_val) => {
+                dest.insert(key, src_val);
+            }
+        }
+    }
+}
+
+/// An agent that keeps MCP servers in `~/<guest_dir>/mcp.json` under
+/// `mcpServers` and expands `${NAME}` from its environment (omp and pi).
+struct McpJsonAgent {
+    /// Agent directory relative to the guest home, e.g. `.omp/agent`.
+    guest_dir: &'static str,
+    /// Config key named in host-side errors, e.g. `omp.config_dir`.
+    config_key: &'static str,
+    /// Label used when resolving `cmd:` header secrets.
+    server_label: &'static str,
+}
+
+const OMP_MCP: McpJsonAgent = McpJsonAgent {
+    guest_dir: OMP_GUEST_DIR,
+    config_key: "omp.config_dir",
+    server_label: "omp MCP server",
+};
+
+const PI_MCP: McpJsonAgent = McpJsonAgent {
+    guest_dir: PI_GUEST_DIR,
+    config_key: "pi.config_dir",
+    server_label: "pi MCP server",
+};
+
+/// Guest shell command that prints `~/<guest_dir>/<file>` when it exists.
+/// It fails when the directory is not searchable, so an unreadable file is
+/// an error rather than an empty document.
+fn guest_file_read_command(guest_dir: &str, file: &str) -> String {
+    format!(
+        "test -x ~/{guest_dir} || exit 1; \
+         if [ -e ~/{guest_dir}/{file} ] || [ -L ~/{guest_dir}/{file} ]; then \
+         cat -- ~/{guest_dir}/{file}; fi"
+    )
+}
+
+/// Replace `~/<guest_dir>/<file>` atomically with `contents`. mktemp creates
+/// the file 0600, so the result is owner-only after the rename.
+fn write_guest_file(
+    target: &SshTarget,
+    guest_dir: &str,
+    file: &str,
+    contents: String,
+) -> Result<()> {
+    target
+        .exec_with_stdin(
+            RemoteCommand::new().literal(format!(
+                "t=\"$(mktemp ~/{guest_dir}/{file}.XXXXXX)\" && \
+                 cat > \"$t\" && mv \"$t\" ~/{guest_dir}/{file}"
+            )),
+            contents.into_bytes(),
+        )
+        .with_context(|| format!("Failed to write managed ~/{guest_dir}/{file}"))
+}
+
+/// Read `file` from the host agent config directory. Missing or disabled
+/// config is empty; a present but unreadable file is an error.
+fn read_host_config_file(
+    config_dir: &ConfigDir,
+    guest_dir: &str,
+    config_key: &str,
+    file: &str,
+) -> Result<String> {
+    let Some(source_dir) = resolve_config_source_dir(config_dir, guest_dir, config_key) else {
         return Ok(String::new());
     };
-    let path = source_dir.join("mcp.json");
+    let path = source_dir.join(file);
     match std::fs::read_to_string(&path) {
         Ok(text) => Ok(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
@@ -2647,33 +2814,63 @@ fn read_host_omp_mcp_json(config_dir: &ConfigDir) -> Result<String> {
     }
 }
 
-/// Merge MCP servers into an omp `mcp.json` document.
+/// Merge host and coop-configured MCP servers into the guest
+/// `~/<guest_dir>/mcp.json`. Leaves the guest file untouched when there is
+/// nothing to merge.
+fn write_managed_mcp_json(
+    target: &SshTarget,
+    agent: &McpJsonAgent,
+    config_dir: &ConfigDir,
+    mcp_servers: &std::collections::HashMap<String, McpServerDef>,
+) -> Result<()> {
+    let guest_dir = agent.guest_dir;
+    let host = read_host_config_file(config_dir, guest_dir, agent.config_key, "mcp.json")?;
+    if host.trim().is_empty() && mcp_servers.is_empty() {
+        return Ok(());
+    }
+
+    target.exec(RemoteCommand::new().literal(format!("mkdir -p ~/{guest_dir}")))?;
+    let existing = target
+        .capture(&guest_file_read_command(guest_dir, "mcp.json"))
+        .with_context(|| format!("Failed to read guest ~/{guest_dir}/mcp.json"))?;
+    let resolved = resolve_mcp_header_secrets(agent.server_label, mcp_servers)?;
+    let merged = merge_mcp_servers_json(
+        &existing,
+        &host,
+        &resolved,
+        &format!("~/{guest_dir}/mcp.json"),
+    )?;
+    write_guest_file(target, guest_dir, "mcp.json", merged)
+}
+
+/// Merge MCP servers into an `mcp.json` document (`path` names it in errors).
 ///
 /// `existing` (the guest file) is the base and keeps every key it has.
 /// Host `mcpServers` entries replace guest entries of the same name, then
 /// `servers` from coop config replace either. Stdio `env` values in coop
-/// config name host variables, so they are written as `${NAME}` for omp to
-/// expand from the guest environment. Empty input is an empty document; a
-/// parse failure is an error.
-fn merge_omp_mcp_json(
+/// config name host variables, so they are written as `${NAME}` for the
+/// agent to expand from the guest environment. Empty input is an empty
+/// document; a parse failure is an error.
+fn merge_mcp_servers_json(
     existing: &str,
     host: &str,
     servers: &std::collections::HashMap<String, McpServerDef>,
+    path: &str,
 ) -> Result<String> {
-    let mut root = parse_omp_mcp_object(existing, "existing ~/.omp/agent/mcp.json")?;
-    let host_root = parse_omp_mcp_object(host, "host ~/.omp/agent/mcp.json")?;
+    let mut root = parse_json_object(existing, &format!("existing {path}"))?;
+    let host_root = parse_json_object(host, &format!("host {path}"))?;
 
     let entry = root
         .entry("mcpServers")
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     let merged = entry
         .as_object_mut()
-        .context("`mcpServers` in ~/.omp/agent/mcp.json is not an object")?;
+        .with_context(|| format!("`mcpServers` in {path} is not an object"))?;
 
     if let Some(host_servers) = host_root.get("mcpServers") {
         let host_servers = host_servers
             .as_object()
-            .context("`mcpServers` in host ~/.omp/agent/mcp.json is not an object")?;
+            .with_context(|| format!("`mcpServers` in host {path} is not an object"))?;
         for (name, def) in host_servers {
             merged.insert(name.clone(), def.clone());
         }
@@ -2685,7 +2882,7 @@ fn merge_omp_mcp_json(
         let Some(def) = servers.get(name) else {
             continue;
         };
-        let mut value = serde_json::to_value(def).context("Failed to serialize omp MCP server")?;
+        let mut value = serde_json::to_value(def).context("Failed to serialize MCP server")?;
         if let Some(env) = value
             .get_mut("env")
             .and_then(serde_json::Value::as_object_mut)
@@ -2700,12 +2897,12 @@ fn merge_omp_mcp_json(
     }
 
     let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(root))
-        .context("Failed to serialize managed ~/.omp/agent/mcp.json")?;
+        .with_context(|| format!("Failed to serialize managed {path}"))?;
     text.push('\n');
     Ok(text)
 }
 
-fn parse_omp_mcp_object(
+fn parse_json_object(
     text: &str,
     label: &str,
 ) -> Result<serde_json::Map<String, serde_json::Value>> {
@@ -4074,6 +4271,8 @@ pub(crate) fn install_agent_plugins(
             AgentKind::Codex => install_codex_marketplaces(session, bin, marketplaces)?,
             AgentKind::Grok => install_grok_marketplaces(session, bin, marketplaces)?,
             AgentKind::Omp => install_omp_marketplaces(session, bin, marketplaces)?,
+            // pi has no marketplaces (see `AgentKind::configured_plugins`).
+            AgentKind::Pi => {}
         }
     }
     if !plugins.is_empty() {
@@ -4082,6 +4281,7 @@ pub(crate) fn install_agent_plugins(
             AgentKind::Codex => install_codex_plugins(session, bin, plugins)?,
             AgentKind::Grok => install_grok_plugins(session, bin, plugins)?,
             AgentKind::Omp => install_omp_plugins(session, bin, plugins)?,
+            AgentKind::Pi => install_pi_packages(session, bin, plugins)?,
         }
     }
     Ok(())
@@ -4238,6 +4438,26 @@ fn install_omp_marketplaces(
         session
             .exec(cmd)
             .with_context(|| format!("Failed to add omp marketplace '{source}'"))?;
+    }
+    Ok(())
+}
+
+/// Install pi packages (`npm:`/`git:` sources) at user scope via
+/// `pi install`, which records each in the guest `~/.pi/agent/settings.json`.
+fn install_pi_packages(
+    session: &SshSession,
+    pi_bin: &GuestPath,
+    packages: &[String],
+) -> Result<()> {
+    for source in packages {
+        tracing::info!("Installing pi package: {source}");
+        let cmd = RemoteCommand::new()
+            .arg(pi_bin)
+            .literal(" install ")
+            .arg(source);
+        session
+            .exec(cmd)
+            .with_context(|| format!("Failed to install pi package '{source}'"))?;
     }
     Ok(())
 }
@@ -6509,6 +6729,7 @@ url = "https://example.com/m"
         (cfg.codex.marketplaces, cfg.codex.plugins) = lists("codex");
         (cfg.grok.marketplaces, cfg.grok.plugins) = lists("grok");
         (cfg.omp.marketplaces, cfg.omp.plugins) = lists("omp");
+        cfg.pi.packages = vec!["pi-p-baked".into(), "pi-p-new".into()];
         let image = ImageName::new("default").unwrap();
 
         std::fs::create_dir_all(cfg.image_dir(&image)).unwrap();
@@ -6526,7 +6747,8 @@ url = "https://example.com/m"
             "grok_marketplaces": ["grok-baked", "claude-new", "codex-new", "omp-new"],
             "grok_plugins": ["grok-p-baked", "claude-p-new", "codex-p-new", "omp-p-new"],
             "omp_marketplaces": ["omp-baked", "claude-new", "codex-new", "grok-new"],
-            "omp_plugins": ["omp-p-baked", "claude-p-new", "codex-p-new", "grok-p-new"]
+            "omp_plugins": ["omp-p-baked", "claude-p-new", "codex-p-new", "grok-p-new"],
+            "pi_packages": ["pi-p-baked", "omp-p-new"]
         }"#;
         std::fs::write(cfg.template_config_path_for(&image), json).unwrap();
 
@@ -6540,6 +6762,87 @@ url = "https://example.com/m"
             assert_eq!(missing_m, [format!("{name}-new")], "{agent:?}");
             assert_eq!(missing_p, [format!("{name}-p-new")], "{agent:?}");
         }
+
+        // pi has packages but no marketplaces.
+        let (missing_m, missing_p) = compute_plugin_delta(&cfg, &image, AgentKind::Pi);
+        assert!(missing_m.is_empty());
+        assert_eq!(missing_p, ["pi-p-new"]);
+    }
+
+    #[test]
+    fn merge_pi_settings_overlays_host_and_keeps_guest_packages() {
+        let existing = r#"{
+            "theme": "dark",
+            "packages": ["npm:guest-installed"],
+            "compaction": {"enabled": true, "reserveTokens": 1000}
+        }"#;
+        let host = r#"{
+            "theme": "light",
+            "defaultModel": "opus",
+            "packages": ["./host-only-package"],
+            "compaction": {"reserveTokens": 2000}
+        }"#;
+
+        let merged: serde_json::Value =
+            serde_json::from_str(&merge_pi_settings(existing, host).unwrap()).unwrap();
+        assert_eq!(merged["theme"], "light");
+        assert_eq!(merged["defaultModel"], "opus");
+        assert_eq!(
+            merged["packages"],
+            serde_json::json!(["npm:guest-installed"])
+        );
+        assert_eq!(merged["compaction"]["enabled"], true);
+        assert_eq!(merged["compaction"]["reserveTokens"], 2000);
+    }
+
+    #[test]
+    fn merge_pi_settings_drops_host_packages_without_guest_file() {
+        let merged: serde_json::Value = serde_json::from_str(
+            &merge_pi_settings("", r#"{"packages": ["npm:x"], "theme": "light"}"#).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(merged, serde_json::json!({"theme": "light"}));
+    }
+
+    #[test]
+    fn merge_pi_settings_rejects_malformed_documents() {
+        for (existing, host) in [("{not json", "{}"), ("[]", "{}"), ("{}", "{not json")] {
+            assert!(
+                merge_pi_settings(existing, host).is_err(),
+                "existing={existing:?} host={host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_allowlist_copies_auth_and_leaves_merged_and_host_state() {
+        let src = tempfile::TempDir::new().unwrap();
+        for file in [
+            "AGENTS.md",
+            "auth.json",
+            "models.json",
+            "settings.json",
+            "mcp.json",
+            "trust.json",
+        ] {
+            std::fs::write(src.path().join(file), file).unwrap();
+        }
+        for dir in ["skills", "sessions", "npm"] {
+            std::fs::create_dir(src.path().join(dir)).unwrap();
+            std::fs::write(src.path().join(dir).join("x"), "x").unwrap();
+        }
+
+        let staged = stage_selected_files(
+            src.path(),
+            PI_ALLOWED_FILES,
+            PI_ALLOWED_DIRS,
+            TreeCopy::SkipHostTrees,
+        )
+        .unwrap();
+        assert_eq!(
+            staged_names(&staged),
+            ["AGENTS.md", "auth.json", "models.json", "skills"]
+        );
     }
 
     #[test]
@@ -6576,7 +6879,7 @@ url = "https://example.com/m"
     }
 
     #[test]
-    fn merge_omp_mcp_json_writes_servers_with_env_references() {
+    fn merge_mcp_servers_json_writes_servers_with_env_references() {
         let mut servers = std::collections::HashMap::new();
         servers.insert(
             "tool".to_string(),
@@ -6593,7 +6896,7 @@ url = "https://example.com/m"
             },
         );
 
-        let merged = merge_omp_mcp_json("", "", &servers).unwrap();
+        let merged = merge_mcp_servers_json("", "", &servers, "~/.omp/agent/mcp.json").unwrap();
         let doc: serde_json::Value = serde_json::from_str(&merged).unwrap();
         let tool = &doc["mcpServers"]["tool"];
         assert_eq!(tool["command"], "npx");
@@ -6606,7 +6909,7 @@ url = "https://example.com/m"
     }
 
     #[test]
-    fn merge_omp_mcp_json_layers_guest_then_host_then_coop_config() {
+    fn merge_mcp_servers_json_layers_guest_then_host_then_coop_config() {
         let existing = r#"{
             "$schema": "https://example.com/schema.json",
             "mcpServers": {
@@ -6619,7 +6922,8 @@ url = "https://example.com/m"
         let servers =
             std::collections::HashMap::from([("both".to_string(), omp_stdio("coop", &[]))]);
 
-        let merged = merge_omp_mcp_json(existing, host, &servers).unwrap();
+        let merged =
+            merge_mcp_servers_json(existing, host, &servers, "~/.omp/agent/mcp.json").unwrap();
         let doc: serde_json::Value = serde_json::from_str(&merged).unwrap();
         assert_eq!(doc["$schema"], "https://example.com/schema.json");
         assert_eq!(doc["mcpServers"]["guest-only"]["command"], "guest-tool");
@@ -6628,7 +6932,7 @@ url = "https://example.com/m"
     }
 
     #[test]
-    fn merge_omp_mcp_json_rejects_malformed_documents() {
+    fn merge_mcp_servers_json_rejects_malformed_documents() {
         let none = std::collections::HashMap::new();
         for (existing, host) in [
             ("{not json", ""),
@@ -6638,7 +6942,7 @@ url = "https://example.com/m"
             ("", r#"{"mcpServers": "x"}"#),
         ] {
             assert!(
-                merge_omp_mcp_json(existing, host, &none).is_err(),
+                merge_mcp_servers_json(existing, host, &none, "~/.omp/agent/mcp.json").is_err(),
                 "existing={existing:?} host={host:?}"
             );
         }

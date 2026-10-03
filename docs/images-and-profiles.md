@@ -8,7 +8,7 @@ A template is a fully provisioned ext4 root filesystem. The build process:
 
 1. Creates an ext4 disk image (default 8 GiB, configurable with `--template-size`)
 2. Provisions a base Ubuntu system (a downloaded Firecracker CI squashfs on Firecracker, Ubuntu 24.04 cloud image on Lima)
-3. Installs base packages, Docker, GitHub CLI, Claude Code, Codex, Grok Build, and omp
+3. Installs base packages, Docker, GitHub CLI, Claude Code, Codex, Grok Build, omp, and pi (with Node.js 22)
 4. Applies requested profiles and extra packages
 5. Runs post-install scripts if provided
 
@@ -54,9 +54,17 @@ the `can1357/oh-my-pi` GitHub release, verified against that release's
 `~/.local/bin/omp` for the guest user. `/usr/local/bin/omp` points there, and
 the image also installs an `omp-yolo` shortcut. The binary is about 250 MB.
 
+**pi CLI:** Node.js 22 from the NodeSource repository (skipped when the `node`
+profile or an earlier step already provides Node.js 22.19 or newer), then
+`@earendil-works/pi-coding-agent` from npm, installed as the guest user under
+`~/.local` with `--ignore-scripts`. `/usr/local/bin/pi` points to
+`~/.local/bin/pi`, and the image also installs a `pi-yolo` shortcut. Because
+every image now carries Node.js 22, the `node` profile adds no runtime of its
+own.
+
 The agents are installed at whatever version was current when the template was built, and that version is not part of the staleness hash — a plain `coop setup` does not refresh them. There are two ways to get newer agents:
 
-- **A live instance:** run `codex update`, `grok update`, or `omp update` inside the VM, or `coop agent update [--claude] [--codex] [--grok] [--omp]` from the host (see [`agent update`](commands.md#agent-update)). Claude Code and Grok Build also auto-update themselves in the background.
+- **A live instance:** run `codex update`, `grok update`, `omp update`, or `pi update` inside the VM, or `coop agent update [--claude] [--codex] [--grok] [--omp] [--pi]` from the host (see [`agent update`](commands.md#agent-update)). Claude Code and Grok Build also auto-update themselves in the background.
 - **The golden image:** `coop setup --rebuild` rebuilds the template from a fresh base, so every new instance ships the latest agents.
 
 ## Built-in profiles
