@@ -13,9 +13,6 @@ use crate::cmd::{Cmd, command_exists};
 #[cfg(target_os = "linux")]
 use crate::config::Instance;
 use crate::config::{CoopConfig, ImageName, InstanceName};
-#[cfg(target_os = "linux")]
-use crate::devcontainer_oci::installed_features;
-use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_DOCKER_REPO,
     SCRIPT_GH_REPO, SCRIPT_LOCALE, resolve_profiles,
@@ -37,7 +34,6 @@ pub struct SetupOptions {
     pub skip_confirm: bool,
     pub rebuild: bool,
     pub profiles: Vec<ProfileDef>,
-    pub oci_features: Vec<ResolvedFeature>,
     pub extra_packages: Vec<String>,
     pub post_install: Option<PathBuf>,
     pub image: ImageName,
@@ -80,8 +76,6 @@ pub struct TemplateConfig {
     pub pi_packages: Vec<String>,
     #[serde(default)]
     pub guest_user: GuestUser,
-    #[serde(default)]
-    pub oci_features: Vec<InstalledFeature>,
 }
 
 impl TemplateConfig {
@@ -623,12 +617,7 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
     let (profiles, extra_packages) = resolve_template_config(cfg, opts)?;
 
     // Compose the install recipe and compute its hashes.
-    let recipe_script = compose_recipe(
-        &profiles,
-        &opts.oci_features,
-        &extra_packages,
-        &opts.guest_user,
-    );
+    let recipe_script = compose_recipe(&profiles, &extra_packages, &opts.guest_user);
     let post_install_content = load_post_install(opts.post_install.as_ref())?;
     let recipe = BuildRecipe {
         profiles: &profiles,
@@ -678,7 +667,6 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         omp_plugins: Vec::new(),
         pi_packages: Vec::new(),
         guest_user: opts.guest_user.clone(),
-        oci_features: installed_features(&opts.oci_features),
     };
 
     let result = build_template(cfg, opts, image, &recipe, &template_config, &staging);
@@ -754,15 +742,6 @@ fn build_template(
     if !recipe.profiles.is_empty() {
         eprintln!("  Profiles: {}", profile_names(recipe.profiles).join(", "));
     }
-    if !opts.oci_features.is_empty() {
-        let features = opts
-            .oci_features
-            .iter()
-            .map(|f| format!("{} ({})", f.installed.id, f.installed.digest))
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprintln!("  Devcontainer OCI features: {features}");
-    }
     if !recipe.extra_packages.is_empty() {
         eprintln!("  Extra packages: {}", recipe.extra_packages.join(", "));
     }
@@ -835,8 +814,7 @@ fn resolve_template_config(
     cfg: &CoopConfig,
     opts: &SetupOptions,
 ) -> Result<(Vec<ProfileDef>, Vec<String>)> {
-    if !opts.profiles.is_empty() || !opts.extra_packages.is_empty() || !opts.oci_features.is_empty()
-    {
+    if !opts.profiles.is_empty() || !opts.extra_packages.is_empty() {
         return Ok((opts.profiles.clone(), opts.extra_packages.clone()));
     }
 
@@ -867,7 +845,6 @@ fn load_post_install(path: Option<&PathBuf>) -> Result<Option<String>> {
 /// Does NOT include version marker, post-install script, or cleanup.
 fn compose_recipe(
     profiles: &[ProfileDef],
-    oci_features: &[ResolvedFeature],
     extra_packages: &[String],
     guest_user: &GuestUser,
 ) -> String {
@@ -972,9 +949,6 @@ fn compose_recipe(
 
     // Guest config configures the guest user — must come before claude-code.
     s.push_str(SCRIPT_GUEST_CONFIG);
-    for feature in oci_features {
-        s.push_str(&crate::devcontainer_oci::compose_install_snippet(feature));
-    }
     // Agent installers run as root in the chroot and install for the guest user.
     for agent in AgentKind::ALL {
         for script in agent.install_scripts() {
@@ -1835,7 +1809,7 @@ mod tests {
 
     #[test]
     fn compose_recipe_no_profiles_succeeds() {
-        let script = compose_recipe(&[], &[], &[], &GuestUser::default());
+        let script = compose_recipe(&[], &[], &GuestUser::default());
         assert!(script.contains("apt-get"));
         assert!(
             script.contains("Installing Codex CLI"),
@@ -1871,7 +1845,7 @@ mod tests {
 
     #[test]
     fn compose_recipe_generates_locale_after_base_packages() {
-        let script = compose_recipe(&[], &[], &[], &GuestUser::default());
+        let script = compose_recipe(&[], &[], &GuestUser::default());
         let install = script.find("Installing core tools").unwrap();
         let locale = script.find("locale-gen en_US.UTF-8").unwrap();
         assert!(install < locale, "locale-gen needs the locales package");
@@ -1881,7 +1855,7 @@ mod tests {
     #[test]
     fn compose_recipe_exports_guest_user() {
         let user = GuestUser::new("vscode").unwrap();
-        let script = compose_recipe(&[], &[], &[], &user);
+        let script = compose_recipe(&[], &[], &user);
         assert!(
             script.contains("export GUEST_USER='vscode'"),
             "recipe must export GUEST_USER for the chroot scripts:\n{script}"
@@ -1891,7 +1865,7 @@ mod tests {
     #[test]
     fn compose_recipe_chowns_guest_home_recursively() {
         // Image skel files arrive as root; the guest must own their home.
-        let script = compose_recipe(&[], &[], &[], &GuestUser::default());
+        let script = compose_recipe(&[], &[], &GuestUser::default());
         assert!(
             script.lines().any(|line| {
                 line.trim() == r#"chown -R "${GUEST_USER}:${GUEST_USER}" "${GUEST_HOME}""#
@@ -1902,20 +1876,27 @@ mod tests {
     }
 
     #[test]
-    fn template_config_loads_legacy_json_without_guest_user_field() {
-        // Pre-PR images on disk have no `guest_user` field; the serde
-        // default keeps them deserializable as `ubuntu`. Regression
-        // guard against accidentally dropping the `#[serde(default)]`.
+    fn template_config_loads_legacy_json_and_drops_removed_fields() {
+        // Legacy images may omit fields added later and retain fields that no
+        // longer have meaning. They must remain readable without carrying the
+        // removed data into newly serialized state.
         let json = r#"{
             "version": 1,
             "created": "2026-01-01T00:00:00Z",
             "install_script_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-            "profiles": [],
+            "profiles": ["node"],
             "extra_packages": [],
-            "post_install_hash": null
+            "post_install_hash": null,
+            "oci_features": [{
+                "id": "ghcr.io/devcontainers/features/node",
+                "reference": "1",
+                "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "install_script_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+            }]
         }"#;
         let tc: TemplateConfig = serde_json::from_str(json).unwrap();
         assert_eq!(tc.guest_user, GuestUser::default());
+        assert_eq!(tc.profiles, ["node"]);
         // Codex bake lists were added later; legacy JSON omits them and
         // must default to empty rather than failing to deserialize.
         assert!(tc.codex_marketplaces.is_empty());
@@ -1925,6 +1906,10 @@ mod tests {
         assert!(tc.omp_marketplaces.is_empty());
         assert!(tc.omp_plugins.is_empty());
         assert!(tc.pi_packages.is_empty());
+
+        let serialized = serde_json::to_value(&tc).unwrap();
+        assert_eq!(serialized["version"], 1);
+        assert!(serialized.get("oci_features").is_none());
     }
 
     #[test]
@@ -1983,7 +1968,7 @@ mod tests {
     #[test]
     fn compose_recipe_post_install_without_trailing_newline() {
         let profiles = vec![profile("test", &["curl"], None, Some("echo done"))];
-        let script = compose_recipe(&profiles, &[], &[], &GuestUser::default());
+        let script = compose_recipe(&profiles, &[], &GuestUser::default());
 
         // The post_install "echo done" must be on its own line
         assert!(
@@ -2001,7 +1986,7 @@ mod tests {
             Some("curl -fsSL https://example.com | bash"),
             None,
         )];
-        let script = compose_recipe(&profiles, &[], &[], &GuestUser::default());
+        let script = compose_recipe(&profiles, &[], &GuestUser::default());
 
         assert!(
             script.contains("| bash\n"),
@@ -2013,7 +1998,7 @@ mod tests {
     #[test]
     fn compose_recipe_scripts_with_trailing_newline_no_double() {
         let profiles = vec![profile("test", &[], Some("pre-cmd\n"), Some("post-cmd\n"))];
-        let script = compose_recipe(&profiles, &[], &[], &GuestUser::default());
+        let script = compose_recipe(&profiles, &[], &GuestUser::default());
 
         // Should not produce triple+ newlines from double-adding
         assert!(
@@ -2029,7 +2014,7 @@ mod tests {
             profile("a", &[], None, Some("echo a-done")),
             profile("b", &[], None, Some("echo b-done")),
         ];
-        let script = compose_recipe(&profiles, &[], &[], &GuestUser::default());
+        let script = compose_recipe(&profiles, &[], &GuestUser::default());
 
         // Each post_install must be on its own line
         assert!(script.contains("echo a-done\n"));

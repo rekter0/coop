@@ -173,9 +173,10 @@ its association with the VM state, leaving the shared PAT intact.
 
 An active assignment rejects managed `GITHUB_TOKEN` **and** `GH_TOKEN` entries
 in `[guest_env]`, Claude, Codex, or Grok `env_forward`, a Grok stdio MCP `env`
-value that names either variable, or persisted `--env` / `containerEnv`
-overrides. Remove these conflicting entries, including saved keys in
-`<instance>/guest_env.json`, or unassign the PAT. This controls coop's
+value that names either variable, or persisted `--env` overrides. Instances
+created by older coop versions can also retain legacy devcontainer
+`containerEnv` overrides. Remove these conflicting entries, including saved
+keys in `<instance>/guest_env.json`, or unassign the PAT. This controls coop's
 delivery; the guest can still change its own environment. The VM receives the
 token's actual authority over every repository it covers.
 
@@ -232,15 +233,6 @@ coop setup --guest-user vscode
 The name is validated against the POSIX-portable pattern `[a-z_][a-z0-9_-]{0,31}`; `root` is rejected because coop assumes an unprivileged uid-1000 account.
 
 The guest user is **baked into the image at setup time and immutable for the image's lifetime** — it is persisted in the image's `template_config.json`, and `up` / `start` / `shell` / `exec` read it back from there. To change it, destroy and recreate the image: `coop destroy && coop setup --guest-user <name>`.
-
-### devcontainer `remoteUser`
-
-When a workspace's `devcontainer.json` declares a `remoteUser` (e.g. `vscode` for the Microsoft devcontainer base images), the handling depends on the stage:
-
-- **At `coop setup`**, a valid `remoteUser` becomes the image's guest user unless `--guest-user` already pins one (the CLI flag wins, and the override is reported).
-- **At `coop up` / `coop start`**, the guest user is already baked in. If the file's `remoteUser` matches the image's persisted user, it is applied; if it differs, coop reports the mismatch, skips forwarding `containerEnv` (its values often reference a `/home/<remoteUser>/...` path that doesn't exist on disk), and points you at `coop destroy && coop setup --guest-user <remoteUser>` to switch.
-
-See [Devcontainer support](devcontainer.md) for the full translation table.
 
 ## Guest PATH
 
@@ -529,8 +521,8 @@ guest_path = "/docs"
 
 The mount applies to every VM, including ones created before you added it:
 each boot uses the current config, and removing the section removes the
-mount at the next start. An `--extra-mount` or devcontainer mount whose guest
-path overlaps `guest_path` is rejected.
+mount at the next start. An `--extra-mount` whose guest path overlaps
+`guest_path` is rejected.
 
 The guest cannot write to it, even as root. Firecracker's read-only drive and
 macOS's read-only share both refuse writes outside the guest, so

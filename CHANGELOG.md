@@ -4,23 +4,6 @@
 
 ### New features
 
-- **Grok Build** — `coop grok` launches Grok Build inside the guest with
-  `--always-approve`, `--trust`, and `--cwd /workspace`. The golden image
-  installs `~/.grok/bin/grok` and a `grok-yolo`
-  shortcut. `[grok]` forwards `XAI_API_KEY`, copies an allowlist from
-  `config_dir` (`AGENTS.md`, `auth.json`, `lsp.json`, `rules/`,
-  `skills/`, `commands/`, `plugins/`, `hooks/`, `agents/`, `workflows/`;
-  directory symlinks skipped), drops the host `[plugins]` table, merges host
-  `config.toml` keys (except `[plugins]`) plus Model Context Protocol
-  servers and `permission_mode` into the guest `~/.grok/config.toml`,
-  records `/workspace` as a trusted folder, and installs configured
-  marketplaces/plugins on first boot. A copied host `auth.json` is set to
-  owner-only (`0600`) and signs the guest in; otherwise use `coop grok --
-  login --device-auth`.
-  `coop agent update --grok` runs `grok update`. Existing images need
-  `coop setup --rebuild`; existing VMs also need
-  `coop restore <vm> --image <image> --reprovision` (or destroy/recreate)
-  to pick up the new binary.
 - **omp** — `coop omp` launches [omp](https://github.com/can1357/oh-my-pi)
   (oh-my-pi) inside the guest with `--yolo`; `--ask` passes
   `--approval-mode always-ask`. The golden image installs the latest
@@ -55,8 +38,8 @@
   directory before each boot and mounts it by label; on macOS/Lima it is a
   live virtiofs mount with `writable: false`, which coop adds to, updates in,
   or removes from an existing instance's `lima.yaml` before restarting it.
-  Guest root cannot write to it or remount it writable. `--extra-mount` and
-  devcontainer mounts that overlap its guest path are rejected.
+  Guest root cannot write to it or remount it writable. `--extra-mount`
+  paths that overlap its guest path are rejected.
 - **More command-line tools in every image** — `nano`, `ripgrep`, `tmux`,
   `vim`, `htop`, `tree`, `lsof`, `fd-find` (`fdfind`), `bat` (`batcat`),
   `xxd`, `dnsutils`, `whois`, `netcat-openbsd`, `socat`, `strace`, `ltrace`,
@@ -86,6 +69,89 @@
   locale over SSH no longer triggers `bash: warning: setlocale: LC_ALL: cannot
   change locale` in every guest shell. Existing images pick it up on their
   next rebuild.
+
+## v0.7.0
+
+### Security
+
+- Fix a Lima mount YAML injection vulnerability on macOS
+  (GHSA-c424-8mvf-m5x9). Host, guest, and image paths are now serialized as
+  quoted YAML scalars, preventing a crafted project directory name selected
+  with `coop up --mount` from injecting an additional writable mount for an
+  unrelated host directory. Releases through v0.6.3 are affected.
+- Stop invoking host Git during `coop pull`. Pull now refuses a nonempty
+  destination unless `--force` explicitly authorizes overwriting matching
+  files. Transports apply best-effort filters for common `.git` paths, and the
+  pull transports stage guest data before a trusted host-side filtered
+  installation. The staging boundary is a host-owned `0700` directory, and
+  pulls sharing a coop data directory are serialized through authorization,
+  transfer, installation, and cleanup. Local writer processes retain that lock
+  if coop is interrupted, so another pull times out instead of reusing an
+  active staging tree. Stale staging data is bounded to one tree and replaced
+  on retry. Pulled content remains untrusted and may be malicious.
+  Repositories pulled by older affected
+  releases must be recreated from a trusted source before use with host Git.
+  The now-redundant `coop pull --exclude-git` flag has been removed; pull's
+  best-effort filtering is unconditional.
+
+### Removed
+
+- Removed devcontainer discovery, translation, OCI Feature installation, and
+  the `coop devcontainer` command (issue #525). The `--devcontainer`,
+  `--no-devcontainer`, and devcontainer translation `--dry-run` flags are no
+  longer accepted. Use coop profiles and the explicit workspace, environment,
+  port, and post-start options. Delete and recreate affected images to remove
+  previously installed Features, profiles, and guest-user choices. Existing
+  instances can retain saved guest environment entries, port forwards,
+  resource settings, and mounts. Destroy and recreate them to clear that state.
+  In particular, an existing Lima VM can retain a live writable host share
+  from a translated mount; reprovisioning its disk does not remove that
+  persisted VM configuration.
+  Obsolete devcontainer preference and per-instance snapshot files are removed
+  during private-storage preparation.
+
+### New features
+
+- **Grok Build** — `coop grok` launches Grok Build inside the guest with
+  `--always-approve`, `--trust`, and `--cwd /workspace`. The golden image
+  installs `~/.grok/bin/grok` and a `grok-yolo`
+  shortcut. `[grok]` forwards `XAI_API_KEY`, copies an allowlist from
+  `config_dir` (`AGENTS.md`, `auth.json`, `lsp.json`, `rules/`,
+  `skills/`, `commands/`, `plugins/`, `hooks/`, `agents/`, `workflows/`;
+  directory symlinks skipped), drops the host `[plugins]` table, merges host
+  `config.toml` keys (except `[plugins]`) plus Model Context Protocol
+  servers and `permission_mode` into the guest `~/.grok/config.toml`,
+  records `/workspace` as a trusted folder, and installs configured
+  marketplaces/plugins on first boot. A copied host `auth.json` is set to
+  owner-only (`0600`) and signs the guest in; otherwise use `coop grok --
+  login --device-auth`.
+  `coop agent update --grok` runs `grok update`. Existing images need
+  `coop setup --rebuild`; existing VMs also need
+  `coop restore <vm> --image <image> --reprovision` (or destroy/recreate)
+  to pick up the new binary.
+
+## v0.6.3
+
+### Security
+
+- Stop invoking host Git during `coop pull`. Pull now refuses a nonempty
+  destination unless `--force` explicitly authorizes overwriting matching
+  files. Transports apply best-effort filters for common `.git` paths, and the
+  tar fallback stages guest archives before installation, but pulled content
+  remains untrusted and may be malicious. Repositories pulled by older affected
+  releases must be recreated from a trusted source before use with host Git.
+  The ineffective `coop pull --exclude-git` compatibility flag has been
+  removed; pull's best-effort filtering is unconditional.
+
+## v0.6.2
+
+### Security
+
+- Isolate guest environment forwarding from host SSH process configuration.
+  Guest-selected names such as `PATH`, loader settings, and SSH settings are
+  now restored only inside the VM through inert transport aliases.
+- Update rustls to 0.23.45 to reject TLS 1.3 handshake messages received at
+  an invalid encryption level (RUSTSEC-2026-0285).
 
 ## v0.6.0
 

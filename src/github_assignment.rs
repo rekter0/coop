@@ -110,7 +110,7 @@ pub fn reject_overrides<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<
     for name in names {
         if matches!(name, "GITHUB_TOKEN" | "GH_TOKEN") {
             bail!(
-                "VM PAT assignment conflicts with managed {name}; remove it from guest_env, env_forward, a Grok, omp, or pi stdio MCP env mapping, and persisted guest_env.json (including --env/containerEnv), or unassign the PAT"
+                "VM PAT assignment conflicts with managed {name}; remove it from guest_env, env_forward, a Grok, omp, or pi stdio MCP env mapping, and persisted guest_env.json (including --env or legacy devcontainer containerEnv), or unassign the PAT"
             );
         }
     }
