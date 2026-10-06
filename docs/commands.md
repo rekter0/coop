@@ -171,8 +171,8 @@ coop setup [FLAGS]
 | `--mem <MiB>` | Memory in MiB (overrides config) |
 | `--rebuild` | Force rebuild of template rootfs |
 | `--profile <list>` | Comma-separated install profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go` |
-| `--extra-packages <list>` | Comma-separated extra apt packages to install |
-| `--post-install <path>` | Path to a post-install script to run in the chroot |
+| `--extra-packages <list>` | Comma-separated extra apt packages to install (Linux/Firecracker only; Lima refuses this option) |
+| `--post-install <path>` | Path to a post-install script to run in the chroot (Linux/Firecracker only; Lima refuses this option) |
 | `--template-size <GiB>` | Template rootfs size in GiB (default: 8) |
 | `--image <name>` | Named image to build (default: `default`) |
 | `--guest-user <name>` | Guest username to bake into the image (default: `ubuntu`). |
@@ -182,6 +182,8 @@ coop setup [FLAGS]
 coop setup -y --profile python,node --template-size 12
 coop setup --image ml-dev --profile python --extra-packages libopenblas-dev
 ```
+
+The second example is Linux/Firecracker only.
 
 ### `start`
 
@@ -414,6 +416,13 @@ coop exec my-project -- docker ps
 ### `stop`
 
 Gracefully stop a running VM. The instance disk is preserved. Use `start` to relaunch or `destroy` to remove it.
+
+On Linux, coop requests a guest reboot over SSH. Firecracker exits when the
+guest finishes shutting down. coop allows 10 seconds for this request and exit,
+then falls back to SIGTERM with a 10-second wait and SIGKILL with a 5-second
+wait. A guest that cannot shut down within the grace period can lose recent
+writes during forced termination. If termination cannot be confirmed, coop
+retains the PID file and socket so you can retry.
 
 ```
 coop stop [NAME]
