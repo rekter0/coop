@@ -167,7 +167,7 @@ the intentional setup and mount differences listed below:
 | Explicit `setup --extra-packages` / `--post-install` | Refused | Consumed by provisioning and image staleness checks |
 | `coop up` | Creates or reconnects/restarts a project VM; `--profile` builds/starts a derived image | Copies rootfs, configures TAP, starts Firecracker; `--profile` builds/starts a derived image |
 | `coop start` | Restarts a stopped Lima VM | Restarts a stopped Firecracker VM |
-| `coop stop` | `limactl stop` | Guest reboot over SSH, SIGTERM, SIGKILL |
+| `coop stop` | `limactl stop` | Guest reboot over SSH, SIGTERM/SIGKILL fallback, remove TAP |
 | `coop destroy` | `limactl delete --force` | Kill process, remove TAP, delete instance dir |
 | `coop status` | Queries `limactl list --json` | Reads PID file, queries guest via SSH |
 | `coop logs` | Reads Lima's `serial.log` | Reads Firecracker log file |

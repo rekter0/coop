@@ -47,8 +47,10 @@
   without a profile. Existing images pick them up on their next rebuild
   (`coop setup` detects the change).
 
-### Fixes
+### Fixed
 
+- `coop stop` now removes a Firecracker instance's TAP after the VM exits,
+  including when Firecracker exited before the stop command.
 - **`coop ssh-config` / `coop editor` aliases** — the `coop-<name>` block now
   goes just above the first `Host`/`Match` line of `~/.ssh/config` instead of
   at the end, so a `Host *` section with its own `User`, `Port`, or
