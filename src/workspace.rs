@@ -160,8 +160,8 @@ pub fn try_load_or_warn(inst: &Instance, consequence: &str) -> Option<WorkspaceS
 ///
 /// Streams `tar cf -` straight into a guest-side `tar xf - -C /workspace`.
 /// No staging file on either side, so peak disk usage on the guest is
-/// just the extracted tree. Integrity relies on SSH's MAC over the
-/// localhost transport plus tar's per-header checksums.
+/// just the extracted tree. SSH protects the stream in transit; tar checks
+/// archive headers. There is no application-level checksum.
 pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path, exclude_git: bool) -> Result<()> {
     let workspace = GuestPath::absolute(GUEST_WORKSPACE)?;
     tar_pipe_transfer_to(target, source_dir, &workspace, exclude_git)
@@ -489,7 +489,8 @@ fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<Work
     )
 }
 
-/// Push local directory to guest. Uses rsync if available, falls back to tar-pipe.
+/// Push local directory to guest. Uses rsync if available, falls back to tar-pipe
+/// except for live Lima mounts, where tar would write into its own source tree.
 ///
 /// Takes a `RunningInstance` so the caller's recent live-state observation is
 /// visible in the signature. The guest can still stop before SSH connects.
@@ -521,12 +522,40 @@ pub fn push(
     if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
         rsync_push(target, &source_dir, &state.guest_path, exclude_git)?;
     } else {
-        tracing::info!("rsync not available on guest, using tar-pipe");
-        tar_pipe_transfer(target, &source_dir, exclude_git)?;
+        tar_push_fallback(
+            target,
+            &source_dir,
+            &state,
+            exclude_git,
+            cfg!(target_os = "macos"),
+        )?;
     }
 
     tracing::info!("Push complete");
     Ok(())
+}
+
+fn tar_fallback_targets_live_mount(source: &WorkspaceSource, mounts_are_live: bool) -> bool {
+    mounts_are_live && matches!(source, WorkspaceSource::Mount { .. })
+}
+
+fn tar_push_fallback(
+    target: &SshTarget,
+    source_dir: &Path,
+    state: &WorkspaceState,
+    exclude_git: bool,
+    mounts_are_live: bool,
+) -> Result<()> {
+    if tar_fallback_targets_live_mount(&state.source, mounts_are_live) {
+        target.exec(RemoteCommand::new().literal("true"))?;
+        bail!(
+            "Cannot tar-push into a live Lima mount: extraction could overwrite its own \
+             host source. Lima mounts normally expose host changes directly; install guest rsync \
+             to push a different --dir."
+        );
+    }
+    tracing::info!("rsync not available on guest, using tar-pipe");
+    tar_pipe_transfer_to(target, source_dir, &state.guest_path, exclude_git)
 }
 
 /// Pull guest workspace to local directory. Uses rsync if available, falls back to tar-pipe.
@@ -1384,6 +1413,8 @@ fn ssh_config_block(target: &SshTarget, inst: &Instance) -> String {
          \x20   User {}\n\
          \x20   IdentityFile {}\n\
          \x20   IdentitiesOnly yes\n\
+         \x20   IdentityAgent none\n\
+         \x20   ForwardAgent no\n\
          \x20   StrictHostKeyChecking no\n\
          \x20   UserKnownHostsFile /dev/null\n\
          \x20   LogLevel ERROR\n\
@@ -1713,7 +1744,7 @@ mod tests {
     use std::num::NonZeroU16;
 
     use super::*;
-    use crate::backend::{Hostname, SshUser};
+    use crate::backend::{Hostname, SshTarget, SshUser};
     use crate::config::{ImageName, InstanceIndex, InstanceName};
     use proptest::prelude::*;
 
@@ -1881,6 +1912,114 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn push_fallback_uses_recorded_guest_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Ok(root) = std::env::var("COOP_TEST_PUSH_FALLBACK_ROOT") else {
+            let temp = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let fake_ssh = temp.path().join("ssh");
+            fs::write(
+                &fake_ssh,
+                "#!/bin/sh\ncase \"$*\" in *'which rsync'*) exit 1;; esac\nfor last; do :; done\nif [ \"$last\" = \"tar xf - -C '/workspace'\" ]; then exit 1; fi\nexec sh -c \"$last\"\n",
+            )
+            .unwrap();
+            fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+            let path = format!(
+                "{}:{}",
+                temp.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workspace::tests::push_fallback_uses_recorded_guest_path",
+                ])
+                .env("COOP_TEST_PUSH_FALLBACK_ROOT", temp.path())
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+
+        let root = Path::new(&root);
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("witness"), "content").unwrap();
+        let guest = root.join("custom 'mount;$(false)");
+        fs::create_dir(&guest).unwrap();
+        let inst = temp_instance(&root.join("instance"));
+        WorkspaceState {
+            guest_path: GuestPath::absolute(guest.to_string_lossy().into_owned()).unwrap(),
+            source: WorkspaceSource::Workspace {
+                host_path: source.clone(),
+            },
+        }
+        .save(&inst)
+        .unwrap();
+        let target = SshTarget {
+            host: Hostname::new("localhost").unwrap(),
+            port: NonZeroU16::new(2222).unwrap(),
+            user: SshUser::new("ubuntu").unwrap(),
+            key_path: root.join("key"),
+        };
+        let running = RunningInstance::new(inst, target);
+        push(&running, None, true, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(guest.join("witness")).unwrap(),
+            "content"
+        );
+
+        fs::remove_file(guest.join("witness")).unwrap();
+        let mount_state = WorkspaceState {
+            guest_path: GuestPath::absolute(guest.to_string_lossy().into_owned()).unwrap(),
+            source: WorkspaceSource::Mount {
+                host_path: source.clone(),
+            },
+        };
+        let error = tar_push_fallback(running.target(), &source, &mount_state, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Cannot tar-push into a live Lima mount"),
+            "{error}"
+        );
+        assert!(!guest.join("witness").exists());
+
+        fs::write(root.join("ssh"), "#!/bin/sh\nexit 255\n").unwrap();
+        let error = tar_push_fallback(running.target(), &source, &mount_state, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SSH command failed"), "{error}");
+    }
+
+    #[test]
+    fn tar_fallback_rejects_only_live_mount_sources() {
+        let mount = WorkspaceSource::Mount {
+            host_path: PathBuf::from("/host"),
+        };
+        let workspace = WorkspaceSource::Workspace {
+            host_path: PathBuf::from("/host"),
+        };
+        let git_repo = WorkspaceSource::GitRepo {
+            url: crate::github_repo::GitRepoUrl::new("https://github.com/x/y.git"),
+        };
+
+        assert!(tar_fallback_targets_live_mount(&mount, true));
+        assert!(!tar_fallback_targets_live_mount(&mount, false));
+        assert!(!tar_fallback_targets_live_mount(&workspace, true));
+        assert!(!tar_fallback_targets_live_mount(&git_repo, true));
     }
 
     #[test]
@@ -2586,6 +2725,8 @@ Host coop-app\n\
         assert!(block.contains("Port 2222"));
         assert!(block.contains("User ubuntu"));
         assert!(block.contains("IdentityFile /tmp/key"));
+        assert!(block.contains("    IdentityAgent none\n"));
+        assert!(block.contains("    ForwardAgent no\n"));
         assert!(block.contains("StrictHostKeyChecking no"));
         assert!(block.contains("UserKnownHostsFile /dev/null"));
     }

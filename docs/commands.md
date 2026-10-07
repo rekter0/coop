@@ -653,8 +653,9 @@ coop logs my-project -f
 
 ### `push`
 
-Copy a local directory into the running VM at `/workspace`. Defaults to the
-host path recorded when the instance was created with `coop up`.
+Copy a local directory into the running VM at the recorded guest path (usually
+`/workspace`). Defaults to the host path recorded when the instance was created
+with `coop up`.
 
 ```
 coop push [NAME] [FLAGS]
@@ -677,7 +678,7 @@ coop push my-project --dir ./src --force
 
 ### `pull`
 
-Copy the VM's `/workspace` to a local directory. Defaults to the host path
+Copy the VM's recorded guest path to a local directory. Defaults to the host path
 recorded when the instance was created with `coop up`. Pulled files are
 controlled by the untrusted guest and may be malicious. Review them before
 executing them or interpreting them with Git, editors, build tools, shells, or
@@ -760,9 +761,14 @@ refresh keeps the alias current without you re-running the command. On
 Linux/Firecracker the host and port are stable, so the refresh is a no-op.
 
 The block sets `StrictHostKeyChecking no` and `UserKnownHostsFile /dev/null`,
-so `ssh coop-*` connections skip host-key verification. This is intentional —
-these VMs regenerate their host keys, so pinning them would only produce
-spurious mismatch warnings.
+so `ssh coop-*` connections skip host-key verification. It also sets
+`IdentityAgent none` and `ForwardAgent no`. Coop's internal SSH, SCP, and rsync
+transports enforce these settings on the command line. For generated `coop-*`
+aliases, OpenSSH uses the first value from matching configuration entries, so
+an earlier global or `Host *` setting can override them; check the effective
+values with `ssh -G coop-<name>`. Host-key verification is disabled because
+these VMs regenerate their host keys, which would otherwise cause mismatch
+warnings.
 
 Use `ssh-config` for ad-hoc copies of arbitrary paths. To sync the tracked
 workspace directory in bulk, use [`push`](#push) / [`pull`](#pull) instead.

@@ -126,6 +126,7 @@ exclude_re = [
   # workspace.rs — tar/rsync pipes, SSH-config IO, editor launch.
   "\\btar_pipe_transfer\\b",
   "\\btar_pipe_transfer_to\\b",
+  "\\btar_push_fallback\\b",
   "\\btar_pipe_pull\\b",
   "\\btar_pipe_pull_staged\\b",
   # Shells out to rsync; install_staged_pull_args remains in scope and pins the
