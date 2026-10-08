@@ -11,6 +11,7 @@ mod cmd;
 mod commands;
 mod completions;
 pub mod config;
+mod creation_hooks;
 mod fs_util;
 mod github_assignment;
 mod github_pat;
@@ -77,8 +78,8 @@ use commands::{
     apply_runtime_guest_env, apply_vm_overrides, cmd_agent_launch, cmd_agent_update, cmd_commit,
     cmd_destroy, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_profiles,
     cmd_proxy, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop,
-    cmd_uninstall, cmd_up, cmd_validate, open_ssh_session, preflight_start_target, prepend_binary,
-    resolve_running,
+    cmd_uninstall, cmd_up, cmd_validate, open_agent_session, preflight_start_target,
+    prepend_binary, resolve_running,
 };
 
 #[derive(Parser)]
@@ -1242,7 +1243,7 @@ pub fn run() -> Result<()> {
             args,
         ),
         Commands::ClaudeAgents { name, mut args } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
             args.insert(0, "agents".to_string());
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))

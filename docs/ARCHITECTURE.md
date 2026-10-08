@@ -190,7 +190,15 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
    `WorkspaceState`. A configured `[readonly_mount]` is already in place by
    now: the backend attaches it at every boot (a read-only drive built by
    `vm.rs` on Firecracker, a `writable: false` virtiofs entry on Lima).
-7. **`post_start`** hook — runs after workspace and mount provisioning,
+7. **Creation hooks** — select a recipe before first boot and persist it in
+   owner-only `creation.json`. After workspace provisioning, run global
+   `post_create` in the guest home.
+   Save successful completion atomically. Failures retain the VM and block agent
+   launch; running `up` and stopped-instance restarts retry the pending hook under
+   the instance operation lock. Guest execution uses a private staged script,
+   a PTY-bound supervisor, and a guest lock; cancellation terminates and reaps
+   the supervised process group. Shell and exec remain available for recovery.
+8. **`post_start`** hook — runs after creation, workspace, and mount provisioning,
    with an SSH session prepared after bootstrap to include newly created proxy
    capability tokens. Hook command failures are warned, not fatal.
 
@@ -210,7 +218,9 @@ retrieval commands and resolved at VM-start by `resolve_cmd_value`.
 
 Per-instance runtime state is a set of JSON sidecar files under the instance
 dir: `instance.json`, `vm_config.json`, `workspace.json`, `forwards.json`,
-`guest_env.json`, `model.json`, `proxy.json`, plus
+`guest_env.json`, `model.json`, `proxy.json`,
+`creation.json` (selected creation recipe, completion, and deferred
+startup hook; mode `0600`), plus
 the Firecracker `.pid`/`.socket`/`.log`/vsock files and, with
 `[readonly_mount]`, its `readonly-mount.ext4` image.
 Allocation refuses an occupied instance path. If any instance directory has

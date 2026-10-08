@@ -6,6 +6,13 @@ Configured [`guest_files`](configuration.md#guest-files) are copied before agent
 bootstrap when you create or restart a VM, including `restore --reprovision` and
 `--no-agents`. Reconnecting to an already-running VM does not refresh them.
 
+[Creation hooks](configuration.md#creation-hooks) run after the workspace is
+ready. A failed hook retains the VM and blocks agent launch. Use `shell` or
+`exec` to debug, then retry `up` on the running VM or `start` after stopping it.
+Completed creation hooks are skipped on ordinary restarts. `restore` resets
+progress; `restore --reprovision` also copies the workspace before rerunning the
+saved recipe.
+
 ## Global Flags
 
 | Flag | Description |
@@ -97,8 +104,8 @@ first so those options can take effect.
 Devcontainer files are ordinary workspace data; coop does not discover,
 translate, or execute them. Use coop profiles, `--env`, `--forward-port`,
 mounts, and `--post-start` explicitly. On first boot, `--post-start` runs after
-agent bootstrap and workspace/mount provisioning, so commands can use copied,
-cloned, and mounted project files.
+agent bootstrap, workspace/mount provisioning, and creation hooks, so commands
+can use copied, cloned, and mounted project files.
 
 Upgrading does not rewrite existing images or VMs. Delete affected images with
 `coop images --delete <image>`, then recreate them with `coop setup --image
@@ -915,16 +922,21 @@ Kept across the wipe, because coop persists them host-side:
 | Workspace association (copy, git clone, or mount) | `workspace.json` |
 | Port forwards | `forwards.json` |
 | Guest env | `guest_env.json` |
+| Creation recipe and deferred startup | `creation.json`; disk replacement resets progress |
 | Model mode and proxy settings | `model.json` / `proxy.json` |
 | Credentials saved in the host secret store | unchanged; guest forwarding depends on the configured auth mode |
 | `[readonly_mount]` | `config.toml`, applied at every boot |
+
+A failed disk replacement preserves completed creation-hook progress when the original
+disk is proven unchanged.
 
 **Not replayed**, because coop does not persist them:
 
 - Extra `--extra-mount` directories. Only the *primary* workspace source is recorded in `workspace.json`, so coop replays none of them. What that costs depends on the backend: on Firecracker, where a mount is a one-time sync into the rootfs, the data goes with the disk and the guest path comes back empty; on Lima the mount is declared in the backend's own `lima.yaml`, which the disk swap does not touch, so it may be served again after the reboot — coop does not guarantee it either way. There is no way to re-add a mount to an existing instance — `--extra-mount` is creation-only, and `coop push` writes to the recorded workspace path — so recovering one means `coop destroy` and a fresh `coop up`.
 - `--exclude-git`. A workspace originally pushed without `.git/` is re-synced with it.
-- An invocation-level `--post-start` command. The override is not persisted;
-  reprovisioning runs the current `post_start` value from `config.toml`, if set.
+- An invocation-level `--post-start` command when no creation hook was selected.
+  When a creation hook was selected, its saved startup command runs after the
+  reset hook completes. Ordinary boots use the current `post_start` selection.
 
 Before replacing the disk, coop checks that the image exists, the state files
 parse, the recorded workspace directory is still there, and host ports for

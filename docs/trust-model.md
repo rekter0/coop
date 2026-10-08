@@ -93,6 +93,11 @@ user launched it.
   `git status --porcelain` from the guest. Today this only gates control flow /
   is printed to the user — it is never fed into `sh -c` on the host. Keep it
   that way.
+- **Global creation commands.** `post_create` becomes a private guest script
+  sent over SSH stdin; it never becomes host shell source. Selected recipes may
+  contain secrets, so `creation.json` is owner-only and debug output redacts
+  commands. Creation commands have the guest user's existing environment and
+  sudo access; failure gates agent launch, not shell/exec access for debugging.
 - **Downloaded update artifacts.** `update.rs` tarball + `SHA256SUMS` from the
   release host — gated by checksum and (best-effort) Sigstore attestation.
 

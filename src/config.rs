@@ -830,12 +830,16 @@ pub struct CoopConfig {
 
     /// Shell command to run inside the guest after every successful boot.
     ///
-    /// Executed after SSH, agent bootstrap, and workspace/mount provisioning,
+    /// Executed after SSH, agent bootstrap, workspace/mount provisioning, and creation hooks,
     /// before any interactive
     /// `shell` / agent launch. A failure is logged at `WARN` and does not
     /// fail the start — a transient hook failure shouldn't strand the VM.
     #[serde(default)]
     pub post_start: Option<String>,
+
+    /// Global guest command run once per newly provisioned VM, after workspace setup.
+    #[serde(default)]
+    pub post_create: Option<String>,
 
     /// Default host:guest port forwards applied to every VM startup.
     ///
@@ -2670,6 +2674,7 @@ impl Default for CoopConfig {
             guest_files: Vec::new(),
             profiles: HashMap::new(),
             post_start: None,
+            post_create: None,
             forward_ports: Vec::new(),
             readonly_mount: None,
             updates: crate::update::UpdateConfig::default(),
