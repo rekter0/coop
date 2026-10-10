@@ -90,6 +90,8 @@ Use the [`integration`](.agents/skills/integration/SKILL.md) skill to run and
 interpret it. [`docs/testing.md`](docs/testing.md) has the full testing
 reference, including mutation scoping and the
 [`mutation-check`](.agents/skills/mutation-check/SKILL.md) skill.
+On macOS, `./tests/run-linux-unit.sh` is a recommended optional pre-push check
+for Linux-specific or Firecracker host-side changes; see [`docs/testing.md`](docs/testing.md).
 
 ## Code style
 

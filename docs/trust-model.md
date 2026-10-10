@@ -146,6 +146,29 @@ host execution authority. Record which consumer interprets each file and what
 authority that interpretation grants; explicit transfer opt-in does not by
 itself authorize host execution.
 
+The Linux network control-plane family is one narrow implementation of this
+contract. `network.rs` selects `sudo`, `ip`, `bridge`, `iptables`, and `sysctl`
+from exact absolute paths. Unset fields use candidates under `/usr/bin`,
+`/usr/sbin`, `/bin`, or `/sbin` and require the canonical target to remain
+under those roots. The invocation-selected config can replace an identity with
+one exact path for non-FHS layouts; an override never falls back to built-ins.
+Both forms validate every actually traversed path component and symlink hop and
+require root ownership, a regular executable target, and no group/other write
+bits. Configured paths establish filesystem control only, not package, hash,
+basename, or command-semantic identity. Coop executes the selected absolute
+spelling (preserving alternatives/multi-call argv[0]),
+clears the launcher environment, supplies only `LANG=C` and `LC_ALL=C`, and
+sets cwd to `/`. Elevated commands use both the resolved absolute `sudo` and
+resolved absolute target. `sudo` may rebuild the elevated command's environment
+or cwd according to trusted sudoers/plugins; the guarantee here is the bounded
+context supplied to `sudo`, not an exact post-policy root environment.
+
+This remains pathname-based validation followed by pathname-based execution;
+it does not pin an inode, validate an executable's loader/library closure, or
+close inherited file descriptors. It also does not cover other host subprocess
+families. Exact overrides are re-resolved from the current config on every
+operation and are never persisted into instance state.
+
 ## Secrets and how they cross into the guest
 
 `[[guest_files]]` explicitly authorizes copying complete host source trees into
@@ -278,11 +301,26 @@ invariants:
 
 ## SSH boundary
 
+- Every coop-owned `ssh`, `scp`, and rsync-with-SSH launch resolves a validated
+  absolute executable from fixed system candidates or an exact
+  `[ssh.host_tools]` setting. The child environment is cleared and rebuilt with
+  `LANG=C` and `LC_ALL=C`, plus only generated `COOP_SSH_ENV_*` aliases or the
+  normalized interactive `TERM` value required by that invocation. Managed
+  clients run from `/` and pass `-F none`, so neither user nor system SSH
+  configuration contributes proxy commands, local commands, environment
+  forwarding, identities, agents, canonicalization, or forwards. Forwarding
+  is disabled unless the call site constructs a specific coop port or proxy
+  forward. The `ssh coop-<name>` alias written for an operator is not a
+  coop-owned process and remains subject to the operator's SSH configuration.
+- An exact host-tool setting authorizes only the validated filesystem identity:
+  coop does not attest its package provenance, hash, basename, or OpenSSH/rsync
+  semantics. Resolution is pathname-based and does not pin an executable
+  descriptor or its dynamic-loader closure.
 - coop connects to the guest with `StrictHostKeyChecking=no`,
   `UserKnownHostsFile=/dev/null`, `IdentitiesOnly=yes`,
   `ForwardAgent=no`, and `IdentityAgent=none`
-  (`backend.rs:SshTarget::transport_opts` — the one list `ssh`, `scp`, and
-  rsync's `-e` all derive from — and `workspace.rs:ssh_config_block`). coop's
+  (`openssh.rs:authority_options` — the one list `ssh`, `scp`, and rsync's
+  `-e` all derive from — and `workspace.rs:ssh_config_block`). coop's
   own transports add `BatchMode=yes`, so a rejected key fails instead of
   falling back to a password prompt; the `~/.ssh/config` block written for the
   user's own `ssh coop-<name>` deliberately does not. This is
@@ -309,6 +347,10 @@ invariants:
   TAP, enables `ip_forward`, and adds a `MASQUERADE` + `FORWARD` ruleset so the
   guest reaches the internet through the host's default interface. A change
   that widens guest egress or adds inbound reachability is a finding.
+- Firecracker setup resolves all five required network-tool identities before
+  default-interface discovery or the first network mutation. Teardown resolves
+  only the tools needed for each cleanup category, logs unavailable best-effort
+  categories, and never falls back to ambient `PATH`.
 - **Guest VMs cannot reach each other by IP.** All Firecracker guests share
   `br0` and a single subnet, so this is enforced, not structural, and it takes
   **two** complementary controls — removing either one re-opens the path:

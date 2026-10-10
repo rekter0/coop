@@ -29,6 +29,8 @@ coop/
 │   ├── workspace.rs        # workspace sync (rsync/tar) + ~/.ssh/config injection
 │   ├── guest.rs            # guest profiles, required binaries, baked package lists
 │   ├── guest_env_state.rs  # persisted guest env vars
+│   ├── host_tool.rs        # typed trusted host-tool resolution + launch context
+│   ├── openssh.rs          # isolated coop-managed SSH/SCP/rsync boundary
 │   ├── proxy.rs            # host proxy processes and per-provider SSH reverse tunnels
 │   ├── proxy_state.rs      # persisted per-instance credential overrides
 │   ├── model_state.rs      # per-instance local/remote model routing
@@ -274,3 +276,15 @@ Hold these when changing the code; the review agents check for their violation:
    `Cmd::arg`** — no shell-string interpolation of tainted input.
 7. **State is transparent JSON sidecars** written atomically
    (`fs_util::atomic_write_*`) without relaxing permissions.
+
+The Linux network control plane adds a narrower host-launch invariant on top
+of item 6. Its `sudo`, `ip`, `bridge`, `iptables`, and `sysctl` identities are
+resolved from fixed absolute system candidates, validated before use, and
+launched from `/` with an environment cleared to deterministic locale values.
+The invocation-selected config may replace any identity with one exact absolute
+path for non-FHS layouts. An override never falls back; it retains the full
+root-owned, non-writable path-chain checks but intentionally does not claim
+package, hash, basename, or command-semantic identity.
+`setup_tap` resolves the complete set before its first probe or mutation. This
+policy is specific to `network.rs`; other host subprocess families retain their
+own launch contracts until migrated.

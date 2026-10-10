@@ -753,6 +753,152 @@ impl<'de> Deserialize<'de> for ConfigPath {
     }
 }
 
+/// Exact executable path selected by the invocation's trusted coop config.
+///
+/// Unlike [`ConfigPath`], this type deliberately performs no `~` expansion:
+/// privileged host-tool selection must be explicit and absolute. Filesystem
+/// ownership and mode are checked immediately before each use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AbsoluteHostToolPath(PathBuf);
+
+impl AbsoluteHostToolPath {
+    fn new(value: &str) -> std::result::Result<Self, String> {
+        if value.is_empty() {
+            return Err("host tool path must not be empty".to_string());
+        }
+        if value.contains('$') || value.split('/').any(|part| part == "~") {
+            return Err("host tool path must not contain shell expansions".to_string());
+        }
+        let path = PathBuf::from(&value);
+        if !path.is_absolute() {
+            return Err("host tool path must be absolute".to_string());
+        }
+        if value != "/"
+            && value
+                .split('/')
+                .skip(1)
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err("host tool path must contain only normal path components".to_string());
+        }
+        if value == "/" {
+            return Err("host tool path must name an executable".to_string());
+        }
+        Ok(Self(path))
+    }
+
+    pub(crate) fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for AbsoluteHostToolPath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Optional exact paths for the Linux network control-plane tools.
+///
+/// Unknown fields are rejected so a typo cannot silently select the built-in
+/// fallback instead of the operator's intended executable.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkHostToolsConfig {
+    pub sudo: Option<AbsoluteHostToolPath>,
+    pub ip: Option<AbsoluteHostToolPath>,
+    pub bridge: Option<AbsoluteHostToolPath>,
+    pub iptables: Option<AbsoluteHostToolPath>,
+    pub sysctl: Option<AbsoluteHostToolPath>,
+}
+
+/// Optional exact paths for coop-managed OpenSSH transport tools.
+///
+/// Unknown fields are rejected so a typo cannot silently select a built-in
+/// executable instead of the operator's intended path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SshHostToolsConfig {
+    pub ssh: Option<AbsoluteHostToolPath>,
+    pub scp: Option<AbsoluteHostToolPath>,
+    pub rsync: Option<AbsoluteHostToolPath>,
+}
+
+impl SshHostToolsConfig {
+    fn is_empty(&self) -> bool {
+        self.ssh.is_none() && self.scp.is_none() && self.rsync.is_none()
+    }
+
+    pub(crate) fn configured(&self) -> impl Iterator<Item = (&'static str, &AbsoluteHostToolPath)> {
+        [
+            ("ssh", self.ssh.as_ref()),
+            ("scp", self.scp.as_ref()),
+            ("rsync", self.rsync.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(name, path)| path.map(|path| (name, path)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_exact_paths(
+        ssh: Option<&Path>,
+        scp: Option<&Path>,
+        rsync: Option<&Path>,
+    ) -> std::result::Result<Self, String> {
+        let parse = |path: Option<&Path>| {
+            path.map(|path| {
+                path.to_str()
+                    .ok_or_else(|| "test host-tool path is not UTF-8".to_string())
+                    .and_then(AbsoluteHostToolPath::new)
+            })
+            .transpose()
+        };
+        Ok(Self {
+            ssh: parse(ssh)?,
+            scp: parse(scp)?,
+            rsync: parse(rsync)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SshConfig {
+    /// Exact host-tool paths selected only by trusted host configuration.
+    #[serde(default, skip_serializing_if = "SshHostToolsConfig::is_empty")]
+    pub host_tools: SshHostToolsConfig,
+}
+
+impl SshConfig {
+    fn is_empty(&self) -> bool {
+        self.host_tools.is_empty()
+    }
+}
+
+impl NetworkHostToolsConfig {
+    fn is_empty(&self) -> bool {
+        self.sudo.is_none()
+            && self.ip.is_none()
+            && self.bridge.is_none()
+            && self.iptables.is_none()
+            && self.sysctl.is_none()
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn configured(&self) -> impl Iterator<Item = (&'static str, &AbsoluteHostToolPath)> {
+        [
+            ("sudo", self.sudo.as_ref()),
+            ("ip", self.ip.as_ref()),
+            ("bridge", self.bridge.as_ref()),
+            ("iptables", self.iptables.as_ref()),
+            ("sysctl", self.sysctl.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(name, path)| path.map(|path| (name, path)))
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CoopConfig {
     /// Invocation-only opt-out; never persisted.
@@ -767,6 +913,10 @@ pub struct CoopConfig {
     pub vm: VmConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+
+    /// Coop-managed OpenSSH client configuration.
+    #[serde(default, skip_serializing_if = "SshConfig::is_empty")]
+    pub ssh: SshConfig,
 
     /// SSH port on the guest
     #[serde(default = "default_ssh_port")]
@@ -1095,6 +1245,12 @@ pub struct NetworkConfig {
     /// Host network interface for NAT (`"auto"` or a name like `eth0`, `ens5`)
     #[serde(default = "default_host_iface")]
     pub host_iface: HostInterface,
+
+    /// Optional exact Linux host-tool paths. These are selected from the
+    /// invocation's config only; project, guest, and saved instance state do
+    /// not contribute values.
+    #[serde(default, skip_serializing_if = "NetworkHostToolsConfig::is_empty")]
+    pub host_tools: NetworkHostToolsConfig,
 }
 
 /// GitHub authentication mode for the guest VM.
@@ -2280,49 +2436,49 @@ impl CoopConfig {
             ));
         }
 
-        if let ConfigDir::Custom(ref path) = self.claude.config_dir
-            && !path.is_dir()
+        #[cfg(target_os = "linux")]
         {
-            errors.push(format!(
-                "claude.config_dir '{}' does not exist or is not a directory",
-                path.display()
-            ));
+            let policy =
+                crate::host_tool::TrustedToolPolicy::new("/", std::iter::empty::<PathBuf>(), 0);
+            for (name, path) in self.network.host_tools.configured() {
+                if let Err(error) =
+                    crate::host_tool::resolve_exact_host_tool(name, path.as_path(), &policy)
+                {
+                    errors.push(format!(
+                        "network.host_tools.{name} '{}': {error}",
+                        path.as_path().display()
+                    ));
+                }
+            }
         }
 
-        if let ConfigDir::Custom(ref path) = self.codex.config_dir
-            && !path.is_dir()
-        {
-            errors.push(format!(
-                "codex.config_dir '{}' does not exist or is not a directory",
-                path.display()
-            ));
+        let ssh_policy = crate::openssh::configured_tool_policy();
+        for (name, path) in self.ssh.host_tools.configured() {
+            if let Err(error) =
+                crate::host_tool::resolve_exact_host_tool(name, path.as_path(), &ssh_policy)
+            {
+                errors.push(format!(
+                    "ssh.host_tools.{name} '{}': {error}",
+                    path.as_path().display()
+                ));
+            }
         }
 
-        if let ConfigDir::Custom(ref path) = self.grok.config_dir
-            && !path.is_dir()
-        {
-            errors.push(format!(
-                "grok.config_dir '{}' does not exist or is not a directory",
-                path.display()
-            ));
-        }
-
-        if let ConfigDir::Custom(ref path) = self.omp.config_dir
-            && !path.is_dir()
-        {
-            errors.push(format!(
-                "omp.config_dir '{}' does not exist or is not a directory",
-                path.display()
-            ));
-        }
-
-        if let ConfigDir::Custom(ref path) = self.pi.config_dir
-            && !path.is_dir()
-        {
-            errors.push(format!(
-                "pi.config_dir '{}' does not exist or is not a directory",
-                path.display()
-            ));
+        for (agent, config_dir) in [
+            ("claude", &self.claude.config_dir),
+            ("codex", &self.codex.config_dir),
+            ("grok", &self.grok.config_dir),
+            ("omp", &self.omp.config_dir),
+            ("pi", &self.pi.config_dir),
+        ] {
+            if let ConfigDir::Custom(path) = config_dir
+                && !path.is_dir()
+            {
+                errors.push(format!(
+                    "{agent}.config_dir '{}' does not exist or is not a directory",
+                    path.display()
+                ));
+            }
         }
 
         if let Some(mount) = &self.readonly_mount
@@ -2659,6 +2815,7 @@ impl Default for CoopConfig {
             data_dir: default_data_dir(),
             vm: VmConfig::default(),
             network: NetworkConfig::default(),
+            ssh: SshConfig::default(),
             ssh_port: default_ssh_port(),
             firecracker_bin: default_firecracker_bin(),
             github: None,
@@ -2700,6 +2857,7 @@ impl Default for NetworkConfig {
             host_ip: default_host_ip(),
             subnet_mask: default_subnet_mask(),
             host_iface: default_host_iface(),
+            host_tools: NetworkHostToolsConfig::default(),
         }
     }
 }
@@ -5136,6 +5294,156 @@ skip = ["not-a-slug"]
         );
         assert_eq!(cfg.network.host_ip, Ipv4Addr::new(172, 16, 0, 1));
         assert_eq!(cfg.network.subnet_mask, SubnetMask::new(24).unwrap());
+    }
+
+    #[test]
+    fn network_host_tool_paths_parse_exact_absolute_values_and_roundtrip() {
+        let source = r#"
+[network.host_tools]
+sudo = "/run/wrappers/bin/sudo"
+ip = "/run/current-system/sw/bin/ip"
+bridge = "/run/current-system/sw/bin/bridge"
+iptables = "/run/current-system/sw/bin/iptables"
+sysctl = "/run/current-system/sw/bin/sysctl"
+"#;
+        let cfg: CoopConfig = toml::from_str(source).unwrap();
+        assert_eq!(
+            cfg.network.host_tools.sudo.as_ref().unwrap().as_path(),
+            Path::new("/run/wrappers/bin/sudo")
+        );
+        assert_eq!(
+            cfg.network.host_tools.ip.as_ref().unwrap().as_path(),
+            Path::new("/run/current-system/sw/bin/ip")
+        );
+
+        let parsed: CoopConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            parsed.network.host_tools.iptables.unwrap().as_path(),
+            Path::new("/run/current-system/sw/bin/iptables")
+        );
+    }
+
+    #[test]
+    fn ssh_host_tool_paths_parse_all_identities_and_roundtrip() {
+        let source = r#"
+[ssh.host_tools]
+ssh = "/run/current-system/sw/bin/ssh"
+scp = "/run/current-system/sw/bin/scp"
+rsync = "/run/current-system/sw/bin/rsync"
+"#;
+        let cfg: CoopConfig = toml::from_str(source).unwrap();
+        assert_eq!(
+            cfg.ssh.host_tools.ssh.as_ref().unwrap().as_path(),
+            Path::new("/run/current-system/sw/bin/ssh")
+        );
+        let parsed: CoopConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            parsed.ssh.host_tools.scp.unwrap().as_path(),
+            Path::new("/run/current-system/sw/bin/scp")
+        );
+        assert_eq!(
+            parsed.ssh.host_tools.rsync.unwrap().as_path(),
+            Path::new("/run/current-system/sw/bin/rsync")
+        );
+    }
+
+    #[test]
+    fn ssh_host_tool_table_rejects_unknown_fields() {
+        let error = toml::from_str::<CoopConfig>("[ssh.host_tools]\nssh_typo = \"/usr/bin/ssh\"\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn network_host_tool_paths_reject_ambiguous_or_non_absolute_values() {
+        for value in [
+            "ip",
+            "~/bin/ip",
+            "/usr/../bin/ip",
+            "/usr/./bin/ip",
+            "/usr//bin/ip",
+            "/usr/bin/$TOOL",
+            "",
+            "/",
+        ] {
+            let source = format!("[network.host_tools]\nip = {value:?}\n");
+            let error = toml::from_str::<CoopConfig>(&source).unwrap_err();
+            assert!(
+                error.to_string().contains("host tool path"),
+                "unexpected error for {value:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_host_tool_table_rejects_unknown_fields() {
+        let error = toml::from_str::<CoopConfig>(
+            "[network.host_tools]\niptables_typo = \"/usr/sbin/iptables\"\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `iptables_typo`"));
+    }
+
+    #[test]
+    fn network_host_tool_paths_deserialize_from_json() {
+        let cfg: CoopConfig =
+            serde_json::from_str(r#"{"network":{"host_tools":{"sudo":"/run/wrappers/bin/sudo"}}}"#)
+                .unwrap();
+        assert_eq!(
+            cfg.network.host_tools.sudo.as_ref().unwrap().as_path(),
+            Path::new("/run/wrappers/bin/sudo")
+        );
+    }
+
+    #[test]
+    fn network_host_tool_empty_state_and_configured_entries_are_exact() {
+        let empty = NetworkHostToolsConfig::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.configured().count(), 0);
+
+        for (field, expected_name) in [
+            ("sudo", "sudo"),
+            ("ip", "ip"),
+            ("bridge", "bridge"),
+            ("iptables", "iptables"),
+            ("sysctl", "sysctl"),
+        ] {
+            let source = format!("[network.host_tools]\n{field} = \"/trusted/{field}\"\n");
+            let cfg: CoopConfig = toml::from_str(&source).unwrap();
+            assert!(!cfg.network.host_tools.is_empty());
+            let configured = cfg.network.host_tools.configured().collect::<Vec<_>>();
+            assert_eq!(configured.len(), 1);
+            assert_eq!(configured[0].0, expected_name);
+            assert_eq!(
+                configured[0].1.as_path(),
+                Path::new(&format!("/trusted/{field}"))
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_rejects_an_unusable_configured_host_tool() {
+        let mut cfg = CoopConfig::default();
+        cfg.network.host_tools.ip =
+            Some(AbsoluteHostToolPath::new("/coop-test-missing/network-tools/ip").unwrap());
+
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("network.host_tools.ip"), "{error}");
+        assert!(
+            error.contains("/coop-test-missing/network-tools/ip"),
+            "{error}"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn validate_does_not_probe_linux_host_tool_paths_on_other_platforms() {
+        let mut cfg = CoopConfig::default();
+        cfg.network.host_tools.ip =
+            Some(AbsoluteHostToolPath::new("/coop-test-missing/network-tools/ip").unwrap());
+
+        cfg.validate().unwrap();
     }
 
     #[test]

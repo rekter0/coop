@@ -70,6 +70,9 @@ jobs:
       - name: Codex account wrapper regression tests
         run: python3 tests/test-codex-account.py
 
+      - name: Linux unit runner regression tests
+        run: python3 tests/test-linux-unit-runner.py
+
       - name: Integration test — proxy reverse forwarding
         run: ./tests/integration-proxy-forward.sh
 

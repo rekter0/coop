@@ -2739,6 +2739,7 @@ mod tests {
             port: std::num::NonZeroU16::new(22).unwrap(),
             user: super::backend::SshUser::new("ubuntu").unwrap(),
             key_path: tmp.path().join("id_test"),
+            host_tools: cfg.ssh.host_tools.clone(),
         };
         let error =
             super::run_configured_post_start(&cfg, &inst, &target, None, cfg.post_start.as_deref())
@@ -3107,6 +3108,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_tools: cfg.ssh.host_tools.clone(),
         };
 
         let session =
@@ -3184,6 +3186,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_tools: cfg.ssh.host_tools.clone(),
         };
 
         let session =
@@ -3232,6 +3235,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_tools: cfg.ssh.host_tools.clone(),
         };
 
         let session =
@@ -3274,6 +3278,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_tools: cfg.ssh.host_tools.clone(),
         };
 
         // The conflict makes Codex unusable, not the VM: a shell/exec/claude
@@ -3321,6 +3326,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_tools: cfg.ssh.host_tools.clone(),
         };
 
         let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
@@ -3351,6 +3357,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_tools: cfg.ssh.host_tools.clone(),
         };
 
         let session =

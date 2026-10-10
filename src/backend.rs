@@ -12,10 +12,11 @@ use indexmap::IndexMap;
 use toml::Value as TomlValue;
 
 use crate::agents::AgentKind;
+#[cfg(target_os = "linux")]
 use crate::cmd::Cmd;
 use crate::config::{
     CodexAuthMode, ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, LocalModel,
-    McpServerDef, NetworkConfig, VmMemory,
+    McpServerDef, NetworkConfig, SshHostToolsConfig, VmMemory,
 };
 use crate::fs_util::{FileLock, lock_sibling_bounded};
 use crate::model_state::ModelState;
@@ -342,6 +343,7 @@ pub struct SshTarget {
     pub port: NonZeroU16,
     pub user: SshUser,
     pub key_path: PathBuf,
+    pub(crate) host_tools: SshHostToolsConfig,
 }
 
 // ── SSH session ───────────────────────────────────────────────
@@ -382,80 +384,38 @@ impl SshTarget {
         dir.join(format!("coop-{short:08x}.sock"))
     }
 
-    /// Options every transport shares, up to the port flag.
-    ///
-    /// `ssh`, `scp`, and rsync's `-e` command all take these; only the port
-    /// flag differs (`-p` vs `-P`), so all three derive from here instead of
-    /// hand-copying a list that then drifts.
-    ///
-    /// The bounds, in the order they take effect. `ConnectTimeout` caps the
-    /// TCP connect and banner exchange. `BatchMode` refuses password and
-    /// passphrase prompts, so a key the guest rejects fails instead of
-    /// blocking on stdin where no interactive user exists (`coop up` in CI).
-    /// `ServerAlive*` then covers the established session: a paused VM, a
-    /// wedged sshd, or a lost TAP device otherwise leaves SSH blocked on a
-    /// dead socket with no deadline. It is answered by sshd itself, not by
-    /// the remote command, so a silent hour-long install is never at risk —
-    /// only a guest whose sshd cannot answer for 90s.
-    fn transport_opts(&self) -> Vec<String> {
-        vec![
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "ConnectTimeout=10".into(),
-            "-o".into(),
-            "ServerAliveInterval=30".into(),
-            "-o".into(),
-            "ServerAliveCountMax=3".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
-            "-o".into(),
-            "ForwardAgent=no".into(),
-            "-o".into(),
-            "IdentityAgent=none".into(),
-            "-o".into(),
-            "IdentitiesOnly=yes".into(),
-            "-o".into(),
-            "LogLevel=ERROR".into(),
-            "-i".into(),
-            self.key_path.display().to_string(),
-        ]
-    }
-
-    /// SSH options for commands.
-    pub fn ssh_opts(&self) -> Vec<String> {
-        let mut opts = self.transport_opts();
-        opts.extend(["-p".into(), self.port.to_string()]);
-        opts
-    }
-
-    /// SSH options with connection multiplexing.
+    /// SSH command with connection multiplexing.
     ///
     /// Only used during boot probing (`wait_until_ready`) where rapid
     /// retries benefit from a shared master connection. The master is
     /// torn down after probing to avoid poisoning later connections
     /// that need `SendEnv` for environment forwarding.
-    fn ssh_opts_mux(&self) -> Vec<String> {
-        let mut opts = self.ssh_opts();
-        opts.extend([
+    fn ssh_mux_command(&self) -> Result<Command> {
+        let mut command = self.ssh_command()?;
+        command.args([
             "-o".into(),
             "ControlMaster=auto".into(),
             "-o".into(),
-            format!("ControlPath={}", self.control_path().display()),
+            format!(
+                "ControlPath={}",
+                crate::openssh::config_path(&self.control_path(), "SSH control socket path")?
+            ),
             "-o".into(),
             "ControlPersist=60".into(),
         ]);
-        opts
+        Ok(command)
     }
 
-    /// SCP options (uses -P for port instead of -p).
-    pub fn scp_opts(&self) -> Vec<String> {
-        let mut opts = vec!["-q".to_string()];
-        opts.extend(self.transport_opts());
-        opts.extend(["-P".into(), self.port.to_string()]);
-        opts
+    pub(crate) fn ssh_command(&self) -> Result<Command> {
+        crate::openssh::ssh_command(self, crate::openssh::Forwarding::Disabled)
+    }
+
+    pub(crate) fn ssh_forward_command(&self) -> Result<Command> {
+        crate::openssh::ssh_command(self, crate::openssh::Forwarding::Explicit)
+    }
+
+    pub(crate) fn rsync_command(&self) -> Result<Command> {
+        crate::openssh::rsync_command(self)
     }
 
     /// user@host address string.
@@ -466,12 +426,10 @@ impl SshTarget {
     /// Run a command on the guest via SSH.
     pub fn exec(&self, command: RemoteCommand) -> Result<()> {
         let cmd = command.into_string();
-        let mut args = self.ssh_opts();
-        args.push(self.addr());
-        args.push(cmd.clone());
-
-        let status = Command::new("ssh")
-            .args(&args)
+        let status = self
+            .ssh_command()?
+            .arg(self.addr())
+            .arg(&cmd)
             .status()
             .context("Failed to run SSH command")?;
 
@@ -486,44 +444,64 @@ impl SshTarget {
     /// The bytes are written to ssh's stdin and forwarded to the remote shell.
     /// Use this when the command needs to consume secrets that must not appear
     /// on argv or in the SSH debug log — e.g. tokens read via `read -r VAR`.
-    pub fn exec_with_stdin(&self, command: RemoteCommand, stdin: Vec<u8>) -> Result<()> {
+    pub fn exec_with_stdin(&self, command: RemoteCommand, stdin: &[u8]) -> Result<()> {
+        use std::io::Write as _;
+        use std::process::Stdio;
         let cmd = command.into_string();
-        let mut args = self.ssh_opts();
-        args.push(self.addr());
-        args.push(cmd.clone());
-        Cmd::new("ssh")
-            .args(args)
-            .stdin_input(stdin)
-            .run()
-            .with_context(|| format!("SSH command failed: {cmd}"))
+        let mut child = self
+            .ssh_command()?
+            .arg(self.addr())
+            .arg(&cmd)
+            .stdin(Stdio::piped())
+            .spawn()
+            .context("Failed to start SSH command")?;
+        let mut child_stdin = child.stdin.take().context("SSH stdin pipe missing")?;
+        let write_result = child_stdin.write_all(stdin);
+        drop(child_stdin);
+        if let Err(error) = write_result {
+            let _ = child.kill();
+            let reap_result = child.wait();
+            return match reap_result {
+                Ok(_) => Err(error).context("Failed to write SSH stdin"),
+                Err(reap_error) => Err(error).context(format!(
+                    "Failed to write SSH stdin; additionally failed to reap SSH child: {reap_error}"
+                )),
+            };
+        }
+        let status = child.wait().context("Failed to wait for SSH command")?;
+        if !status.success() {
+            bail!("SSH command failed: {cmd}");
+        }
+        Ok(())
     }
 
     /// Check if a command succeeds on the guest.
-    pub fn exec_ok(&self, command: RemoteCommand) -> bool {
-        let mut args = self.ssh_opts();
-        args.push(self.addr());
-        args.push(command.into_string());
-
-        Command::new("ssh")
-            .args(&args)
+    pub fn exec_ok(&self, command: RemoteCommand) -> Result<bool> {
+        let command = command.into_string();
+        let status = self
+            .ssh_command()?
+            .arg(self.addr())
+            .arg(command)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok_and(|s| s.success())
+            .context("Failed to launch SSH command probe")?;
+        Ok(status.success())
     }
 
     /// Like `exec_ok` but uses connection multiplexing for fast retries.
-    fn probe_ok_mux(&self, command: RemoteCommand) -> bool {
-        let mut args = self.ssh_opts_mux();
-        args.push(self.addr());
-        args.push(command.into_string());
+    fn probe_ok_mux(&self, command: RemoteCommand) -> Result<bool> {
+        let command = command.into_string();
 
-        Command::new("ssh")
-            .args(&args)
+        let status = self
+            .ssh_mux_command()?
+            .arg(self.addr())
+            .arg(command)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok_and(|s| s.success())
+            .context("Failed to launch multiplexed SSH readiness probe")?;
+        Ok(status.success())
     }
 
     /// Wait until SSH is ready, retrying with exponential backoff.
@@ -542,7 +520,7 @@ impl SshTarget {
         tracing::info!("Probing SSH readiness (timeout: {timeout:?})");
 
         loop {
-            if self.probe_ok_mux(RemoteCommand::new().literal("true")) {
+            if self.probe_ok_mux(RemoteCommand::new().literal("true"))? {
                 tracing::info!("SSH is ready");
                 self.close_mux();
                 return Ok(());
@@ -564,8 +542,7 @@ impl SshTarget {
 
     /// SCP a local file to the guest.
     pub fn scp_to(&self, local: &HostPath, remote: &GuestPath) -> Result<()> {
-        let status = Command::new("scp")
-            .args(self.scp_opts())
+        let status = crate::openssh::scp_command(self)?
             .arg(local.as_path())
             .arg(format!("{}:{remote}", self.addr()))
             .status()
@@ -579,8 +556,7 @@ impl SshTarget {
 
     /// Copy a local directory to the guest recursively via scp.
     pub fn scp_to_recursive(&self, local: &HostPath, remote: &GuestPath) -> Result<()> {
-        let status = Command::new("scp")
-            .args(self.scp_opts())
+        let status = crate::openssh::scp_command(self)?
             .arg("-r")
             .arg(local.as_path())
             .arg(format!("{}:{remote}", self.addr()))
@@ -595,21 +571,19 @@ impl SshTarget {
 
     /// SSH command string for rsync's -e flag.
     ///
-    /// Derived from [`Self::ssh_opts`] so a transfer inherits the same bounds
-    /// as any other guest command. rsync splits this string on whitespace, so
-    /// it stays unquoted — a key path containing spaces has never worked here.
-    pub fn rsync_ssh_cmd(&self) -> String {
-        format!("ssh {}", self.ssh_opts().join(" "))
+    /// Built from the resolved SSH executable and shared transport authority
+    /// policy. Every word is validated against rsync's `-e` parser grammar;
+    /// paths that cannot be represented unambiguously are rejected.
+    pub fn rsync_ssh_cmd(&self) -> Result<String> {
+        crate::openssh::rsync_ssh_command(self)
     }
 
     /// Run a command on the guest via SSH and capture stdout.
     pub fn capture(&self, cmd: &str) -> Result<String> {
-        let mut args = self.ssh_opts();
-        args.push(self.addr());
-        args.push(cmd.to_string());
-
-        let output = Command::new("ssh")
-            .args(&args)
+        let output = self
+            .ssh_command()?
+            .arg(self.addr())
+            .arg(cmd)
             .stderr(std::process::Stdio::null())
             .output()
             .context("Failed to run SSH command")?;
@@ -630,12 +604,17 @@ impl SshTarget {
             return;
         }
         tracing::debug!("Closing SSH control master at {}", sock.display());
-        let control_arg = format!("ControlPath={}", sock.display());
-        let result = Command::new("ssh")
-            .args(["-O", "exit", "-o", &control_arg, &self.addr()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let result = self.ssh_command().and_then(|mut ssh| {
+            let control_arg = format!(
+                "ControlPath={}",
+                crate::openssh::config_path(&sock, "SSH control socket path")?
+            );
+            ssh.args(["-O", "exit", "-o", &control_arg, &self.addr()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .context("Failed to launch SSH control request")
+        });
         match result {
             Ok(s) if s.success() => {
                 tracing::debug!("Closed SSH control master");
@@ -653,8 +632,7 @@ impl SshTarget {
 impl SshSession {
     /// Build every environment-bearing SSH launch through the same boundary.
     pub fn command(&self, options: &[String], remote: &str) -> Result<Command> {
-        let mut ssh = Command::new("ssh");
-        ssh.args(self.target.ssh_opts());
+        let mut ssh = self.target.ssh_command()?;
         let remote = self.env.wrap_command(&mut ssh, remote)?;
         ssh.args(options).arg(self.target.addr()).arg(remote);
         Ok(ssh)
@@ -1133,7 +1111,7 @@ impl VmBackend for FirecrackerBackend {
         new_size: crate::config::GiB,
     ) -> Result<()> {
         let _ = cfg;
-        crate::setup::resize_rootfs(stopped.instance(), new_size)
+        crate::setup::resize_rootfs(stopped, new_size)
     }
 
     fn set_machine_resources(
@@ -1225,7 +1203,8 @@ impl VmBackend for FirecrackerBackend {
             host: Hostname::from(inst.guest_ip()),
             port: cfg.ssh_port,
             user: SshUser::new(guest_user.as_str())?,
-            key_path: cfg.ssh_key_path(),
+            key_path: std::path::absolute(cfg.ssh_key_path())?,
+            host_tools: cfg.ssh.host_tools.clone(),
         })
     }
 
@@ -1703,7 +1682,7 @@ fn bootstrap_claude(
         if needs_claude_cli
             && !session
                 .target
-                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&claude_bin))
+                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&claude_bin))?
         {
             bail!(
                 "Claude Code CLI is not installed in the guest.\n\
@@ -1836,7 +1815,7 @@ fn bootstrap_codex(
             RemoteCommand::new()
                 .literal("test -x ")
                 .arg(crate::guest::codex_bin()),
-        ) {
+        )? {
             // The caller's guard tears down the proxy started above on this error.
             bail!("{}", codex_missing_guest_cli_message());
         }
@@ -1940,7 +1919,7 @@ fn bootstrap_grok(
         if needs_grok_cli
             && !session
                 .target
-                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&grok_bin))
+                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&grok_bin))?
         {
             bail!(
                 "Grok Build CLI is not installed in the guest.\n\
@@ -1991,7 +1970,7 @@ fn bootstrap_omp(
         if needs_omp_cli
             && !session
                 .target
-                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&omp_bin))
+                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&omp_bin))?
         {
             bail!(
                 "omp is not installed in the guest.\n\
@@ -2040,7 +2019,7 @@ fn bootstrap_pi(
         && !pi.packages.is_empty()
         && !session
             .target
-            .exec_ok(RemoteCommand::new().literal("test -x ").arg(&pi_bin))
+            .exec_ok(RemoteCommand::new().literal("test -x ").arg(&pi_bin))?
     {
         bail!(
             "pi is not installed in the guest.\n\
@@ -2142,7 +2121,7 @@ pub fn ensure_codex_keyring_configured(target: &SshTarget) -> Result<()> {
     let configured = target.exec_ok(RemoteCommand::new().literal(
         "IFS= read -r first_line < ~/.codex/config.toml \
          && [ \"$first_line\" = 'cli_auth_credentials_store = \"keyring\"' ]",
-    ));
+    ))?;
     if configured {
         return Ok(());
     }
@@ -2157,7 +2136,7 @@ pub fn ensure_codex_account_guest_support(target: &SshTarget) -> Result<()> {
             .literal(" && command -v dbus-run-session >/dev/null 2>&1")
             .literal(" && command -v gnome-keyring-daemon >/dev/null 2>&1")
             .literal(" && command -v secret-tool >/dev/null 2>&1"),
-    );
+    )?;
     if supported {
         return Ok(());
     }
@@ -2337,7 +2316,7 @@ fn prepare_claude_config_import(
             "t=\"$(mktemp ~/.claude/coop-import.json.XXXXXX)\" && \
              cat > \"$t\" && mv \"$t\" ~/.claude/coop-import.json",
         ),
-        serde_json::to_vec(&snapshot)?,
+        &serde_json::to_vec(&snapshot)?,
     )?;
     Ok(Some(staged))
 }
@@ -2363,7 +2342,7 @@ fn copy_grok_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> {
 /// Owner-only mode for a copied host `~/.grok/auth.json`. `scp` without `-p`
 /// creates the guest file with the remote umask (typically 0644).
 fn restrict_guest_grok_auth(target: &SshTarget) -> Result<()> {
-    if !target.exec_ok(RemoteCommand::new().literal("test -f ~/.grok/auth.json")) {
+    if !target.exec_ok(RemoteCommand::new().literal("test -f ~/.grok/auth.json"))? {
         return Ok(());
     }
     target
@@ -2426,7 +2405,7 @@ fn write_managed_grok_config(
                 "t=\"$(mktemp ~/.grok/config.toml.XXXXXX)\" && \
                  cat > \"$t\" && mv \"$t\" ~/.grok/config.toml",
             ),
-            merged.into_bytes(),
+            merged.as_bytes(),
         )
         .context("Failed to write managed ~/.grok/config.toml")?;
     Ok(())
@@ -2573,7 +2552,7 @@ fn write_workspace_folder_trust(target: &SshTarget) -> Result<()> {
                 "t=\"$(mktemp ~/.grok/trusted_folders.toml.XXXXXX)\" && \
                  cat > \"$t\" && mv \"$t\" ~/.grok/trusted_folders.toml",
             ),
-            merged.into_bytes(),
+            merged.as_bytes(),
         )
         .context("Failed to write ~/.grok/trusted_folders.toml")?;
     Ok(())
@@ -2755,7 +2734,7 @@ fn write_managed_pi_settings(target: &SshTarget, config_dir: &ConfigDir) -> Resu
         .capture(&guest_file_read_command(PI_GUEST_DIR, "settings.json"))
         .context("Failed to read guest ~/.pi/agent/settings.json")?;
     let merged = merge_pi_settings(&existing, &host)?;
-    write_guest_file(target, PI_GUEST_DIR, "settings.json", merged)
+    write_guest_file(target, PI_GUEST_DIR, "settings.json", &merged)
 }
 
 /// Merge host pi settings into the guest `settings.json`.
@@ -2837,19 +2816,14 @@ fn guest_file_read_command(guest_dir: &str, file: &str) -> String {
 
 /// Replace `~/<guest_dir>/<file>` atomically with `contents`. mktemp creates
 /// the file 0600, so the result is owner-only after the rename.
-fn write_guest_file(
-    target: &SshTarget,
-    guest_dir: &str,
-    file: &str,
-    contents: String,
-) -> Result<()> {
+fn write_guest_file(target: &SshTarget, guest_dir: &str, file: &str, contents: &str) -> Result<()> {
     target
         .exec_with_stdin(
             RemoteCommand::new().literal(format!(
                 "t=\"$(mktemp ~/{guest_dir}/{file}.XXXXXX)\" && \
                  cat > \"$t\" && mv \"$t\" ~/{guest_dir}/{file}"
             )),
-            contents.into_bytes(),
+            contents.as_bytes(),
         )
         .with_context(|| format!("Failed to write managed ~/{guest_dir}/{file}"))
 }
@@ -2899,7 +2873,7 @@ fn write_managed_mcp_json(
         &resolved,
         &format!("~/{guest_dir}/mcp.json"),
     )?;
-    write_guest_file(target, guest_dir, "mcp.json", merged)
+    write_guest_file(target, guest_dir, "mcp.json", &merged)
 }
 
 /// Merge MCP servers into an `mcp.json` document (`path` names it in errors).
@@ -3432,7 +3406,7 @@ fn write_managed_claude_settings(
                 "t=\"$(mktemp ~/.claude/settings.json.XXXXXX)\" && \
                  cat > \"$t\" && mv \"$t\" ~/.claude/settings.json",
             ),
-            merged.into_bytes(),
+            merged.as_bytes(),
         )
         .context("Failed to write managed ~/.claude/settings.json in guest")?;
     tracing::debug!("Wrote managed ~/.claude/settings.json to guest");
@@ -3558,7 +3532,7 @@ fn write_claude_json(target: &SshTarget, contents: &str) -> Result<()> {
                 "t=\"$(mktemp ~/.claude.json.XXXXXX)\" && \
                  cat > \"$t\" && mv \"$t\" ~/.claude.json",
             ),
-            contents.as_bytes().to_vec(),
+            contents.as_bytes(),
         )
         .context("Failed to write ~/.claude.json in guest")
 }
@@ -4687,7 +4661,7 @@ fn clone_with_token(target: &SshTarget, repo_url: &str, token: &str) -> Result<(
     let mut stdin = Vec::with_capacity(token.len() + 1);
     stdin.extend_from_slice(token.as_bytes());
     stdin.push(b'\n');
-    target.exec_with_stdin(build_clone_with_token_script(repo_url), stdin)
+    target.exec_with_stdin(build_clone_with_token_script(repo_url), &stdin)
 }
 
 /// Build the remote shell script that reads a GitHub token from stdin and
@@ -4859,6 +4833,7 @@ mod tests {
             port: NonZeroU16::new(22).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: root.join("key"),
+            host_tools: SshHostToolsConfig::default(),
         };
         LimaBackend::new()
             .stop(&CoopConfig::default(), RunningInstance::new(inst, target))
@@ -4949,16 +4924,27 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             port: NonZeroU16::new(22).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: PathBuf::from("/tmp/test-key"),
+            host_tools: SshHostToolsConfig::default(),
         }
+    }
+
+    fn command_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
     fn every_transport_disables_host_agent() {
         let target = ssh_test_target();
         for (name, opts) in [
-            ("ssh", target.ssh_opts()),
-            ("scp", target.scp_opts()),
-            ("mux", target.ssh_opts_mux()),
+            ("ssh", command_args(&target.ssh_command().unwrap())),
+            (
+                "scp",
+                command_args(&crate::openssh::scp_command(&target).unwrap()),
+            ),
+            ("mux", command_args(&target.ssh_mux_command().unwrap())),
         ] {
             for option in ["IdentityAgent=none", "ForwardAgent=no"] {
                 assert_eq!(
@@ -4968,7 +4954,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
                 );
             }
         }
-        let rsync = target.rsync_ssh_cmd();
+        let rsync = target.rsync_ssh_cmd().unwrap();
         assert!(rsync.contains("-o IdentityAgent=none"));
         assert!(rsync.contains("-o ForwardAgent=no"));
     }
@@ -4976,9 +4962,9 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     #[test]
     fn every_transport_is_bounded_against_a_wedged_guest() {
         let target = ssh_test_target();
-        let ssh = target.ssh_opts();
-        let scp = target.scp_opts();
-        let rsync = target.rsync_ssh_cmd();
+        let ssh = command_args(&target.ssh_command().unwrap());
+        let scp = command_args(&crate::openssh::scp_command(&target).unwrap());
+        let rsync = target.rsync_ssh_cmd().unwrap();
 
         for bound in [
             "BatchMode=yes",
@@ -4997,7 +4983,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         for (name, opts) in [
             ("ssh", ssh),
             ("scp", scp),
-            ("mux", target.ssh_opts_mux()),
+            ("mux", command_args(&target.ssh_mux_command().unwrap())),
             ("rsync", rsync.split(' ').map(str::to_string).collect()),
         ] {
             let pairs = opts.iter().filter(|o| o.starts_with("ServerAlive")).count();
@@ -5006,13 +4992,92 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     }
 
     #[test]
+    fn readiness_preserves_host_tool_resolution_failures() {
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let mut target = ssh_test_target();
+        target.host_tools = SshHostToolsConfig::with_exact_paths(
+            Some(&fixture.path().join("missing-ssh")),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let error = target.wait_until_ready(Duration::ZERO).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("built-in fallback was not attempted"));
+        assert!(!message.contains("SSH not ready"));
+    }
+
+    #[test]
+    fn command_probe_preserves_process_launch_failures() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let ssh = fixture.path().join("ssh");
+        fs::write(&ssh, "#!/definitely/missing/coop-test-interpreter\n").unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut target = ssh_test_target();
+        target.host_tools = SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap();
+
+        let error = target
+            .exec_ok(RemoteCommand::new().literal("true"))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Failed to launch SSH command probe"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn stdin_write_failure_reaps_the_ssh_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let pid_file = fixture.path().join("ssh.pid");
+        let ssh = fixture.path().join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nexit 0\n",
+                crate::shell::shell_escape(&pid_file.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut target = ssh_test_target();
+        target.host_tools = SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap();
+
+        let error = target
+            .exec_with_stdin(
+                RemoteCommand::new().literal("true"),
+                &vec![b'x'; 8 * 1024 * 1024],
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Failed to write SSH stdin"));
+        let pid = fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
     fn ssh_and_scp_options_differ_only_in_the_port_flag() {
         let target = ssh_test_target();
-        let ssh = target.ssh_opts();
-        let scp = target.scp_opts();
+        let ssh = command_args(&target.ssh_command().unwrap());
+        let scp = command_args(&crate::openssh::scp_command(&target).unwrap());
 
         assert_eq!(scp.first().map(String::as_str), Some("-q"));
-        assert_eq!(scp[1..scp.len() - 2], ssh[..ssh.len() - 2]);
+        assert_eq!(scp[1..scp.len() - 4], ssh[..ssh.len() - 2]);
+        assert_eq!(scp[scp.len() - 4], "-S");
+        assert!(Path::new(&scp[scp.len() - 3]).is_absolute());
         assert!(scp.ends_with(&["-P".to_string(), "22".to_string()]));
         assert!(ssh.ends_with(&["-p".to_string(), "22".to_string()]));
     }
@@ -7686,6 +7751,7 @@ url = "https://example.com/m"
                 port: NonZeroU16::new(22).unwrap(),
                 user: SshUser::new("ubuntu").unwrap(),
                 key_path: "/unused-test-key".into(),
+                host_tools: SshHostToolsConfig::default(),
             },
             env,
         }
@@ -7716,7 +7782,17 @@ url = "https://example.com/m"
         let session = forwarding_session(&entries);
         let ssh = session.command(&[], "/usr/bin/env -0").unwrap();
         let host_env: Vec<_> = ssh.get_envs().collect();
-        assert_eq!(host_env.len(), entries.len());
+        assert_eq!(host_env.len(), entries.len() + 2);
+        assert!(
+            host_env.iter().any(|(key, value)| {
+                *key == "LANG" && *value == Some(std::ffi::OsStr::new("C"))
+            })
+        );
+        assert!(
+            host_env.iter().any(|(key, value)| {
+                *key == "LC_ALL" && *value == Some(std::ffi::OsStr::new("C"))
+            })
+        );
         for (index, (_, value)) in entries.iter().enumerate() {
             let alias = format!("COOP_SSH_ENV_{index}");
             assert!(
@@ -7814,6 +7890,12 @@ url = "https://example.com/m"
             port: NonZeroU16::new(2222).unwrap(),
             user: SshUser::new("root").unwrap(),
             key_path: fixture.join("client"),
+            host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+                Some(&fixture.join("bin/ssh")),
+                None,
+                None,
+            )
+            .unwrap(),
         };
         let output = session
             .command(&[], "/usr/bin/env -0")
@@ -7830,6 +7912,7 @@ url = "https://example.com/m"
             assert_eq!(actual.get(name), Some(&value));
         }
         assert!(!actual.contains_key("COOP_SSH_ENV_1"));
+        assert!(!actual.contains_key("COOP_AMBIENT_SENTINEL"));
 
         // Force a PTY even when the CI runner has no local terminal. The bash
         // expression also checks preservation of the fixture account's shell.
