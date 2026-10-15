@@ -125,6 +125,13 @@ Lifecycle and guest-visible changes still require both real backends:
 
 ## Integration tests
 
+Generated completion is checked without a VM by
+`cargo test --test shell_completion --test zsh_completion`.
+CI runs the generated Bash and zsh
+scripts, including zsh's first Tab after `$fpath` autoloading. All five shells
+have generation and dynamic-protocol checks; fish, elvish, and PowerShell
+interpreters are not required or installed for these checks.
+
 VM integration uses two scripts:
 
 - `tests/integration.sh` — the test suite. Runs locally, requires `--binary`.
@@ -207,6 +214,13 @@ temporary loopback HTTP server and require Python 3, Bash, and curl;
 Linux CI runs them. The full VM suite additionally checks these probes against
 real guests. A host FORWARD policy other than ACCEPT still causes an explicit
 skip of the routed guest-isolation probe, since it would mask the coop rule.
+
+Run `tests/integration-update.sh` for the host-only self-updater flow. The
+script compiles a distinct `COOP_FORCE_BUILD_KIND=test` binary and supplies its
+loopback fixture through `COOP_UPDATE_TEST_API_BASE_URL`; only that build kind
+can construct the fixture source. Normal release builds reject the retired
+`COOP_UPDATE_API_BASE_URL` control before network I/O. The fixture also covers
+checksum and attestation failures without changing an installed coop binary.
 
 Run `python3 tests/test-codex-account.py` for the account wrapper's argument,
 login/logout, API-key passthrough, and `codex-yolo` regressions (also in Linux
@@ -432,6 +446,8 @@ parsing, or state composition:
 - `src/github_repo.rs`, `src/github_pat.rs`, `src/secret_store.rs` — slug
   parsing and secret routing
 - `src/fs_util.rs` — path manipulation helpers
+- `src/update_policy.rs` — updater source, tag, and release-asset identity
+  policy (the shell-out orchestration remains in excluded `src/update.rs`)
 - `src/commands/` — pure input-compatibility guards, summary/message builders,
   byte-to-GiB arithmetic kernels, and predicates such as
   `is_sensitive_workspace`
